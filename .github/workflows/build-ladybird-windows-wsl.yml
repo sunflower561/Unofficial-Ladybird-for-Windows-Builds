@@ -29,11 +29,20 @@ jobs:
           echo "Building Ladybird @ ${{ inputs.ref }}"
           git log -1 --oneline
 
+      # ✅ 【新增修复步骤】：手动更新 WSL 并检查状态
+      - name: Fix and Update WSL
+        shell: pwsh
+        run: |
+          # 尝试更新 WSL，解决潜在的环境损坏问题
+          wsl --update --web-download
+          # 输出 WSL 状态，方便确认
+          wsl --status
+          wsl --list --verbose
+
       - name: Setup WSL2 (Ubuntu)
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
-          # 【关键修复 1】：补充 vcpkg 引导必须的基础工具 (curl, unzip, zip, tar)
           additional-packages: |
             curl zip unzip tar git \
             autoconf autoconf-archive automake build-essential ccache cmake \
@@ -44,36 +53,24 @@ jobs:
       - name: Build inside WSL2 (as non-root user)
         shell: wsl-bash {0}
         run: |
-          # 1. 创建普通用户 builder，并给予 sudo 权限
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-          # 2. 将代码从 Windows 慢速挂载盘复制到 WSL 原生极速盘
           WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
           echo "Source Windows Dir: $WORKSPACE_DIR"
           
           mkdir -p /home/builder/ladybird
           cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
           cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
-
-          # 3. 更改目录所有权给 builder 用户
           chown -R builder:builder /home/builder/ladybird
 
-          # 4. 切换到普通用户进行编译
           cd /home/builder/ladybird
-          
-          # 【关键修复 2】：告知 git 信任该目录，防止子模块报 dubious ownership 错误
           su builder -c "git config --global --add safe.directory '*'"
-          
-          # 【关键修复 3】：使用 bash -l -c 确保环境变量正确加载，并实时输出 vcpkg 日志
           su builder -c "bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
 
-          # 5. 编译成功，将产物拷回 GitHub 工作区
           mkdir -p "$WORKSPACE_DIR/dist"
           cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
-          chmod -R 777 "$WORKSPACE_DIR/dist" # 确保宿主机有权限读取
-          
-          echo "=== 检查生成的产物架构 ==="
+          chmod -R 777 "$WORKSPACE_DIR/dist"
           file "$WORKSPACE_DIR/dist/bin/Ladybird"
 
       - name: Upload artifact
