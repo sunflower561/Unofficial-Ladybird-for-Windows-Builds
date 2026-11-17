@@ -38,8 +38,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
 
-      # 3. 配置 MSVC x64 环境
+      # 3. 配置 MSVC x64 编译环境
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -74,10 +75,13 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           python -m pip install --upgrade pip
-          python -m pip install --upgrade cmake ninja aqtinstall
-
           if ($LASTEXITCODE -ne 0) {
-            throw "Python build dependencies installation failed"
+            throw "pip upgrade failed"
+          }
+
+          python -m pip install --upgrade cmake ninja aqtinstall
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python dependencies installation failed"
           }
 
           python --version
@@ -89,7 +93,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # 7. 缓存 Rust
+      # 7. Rust 缓存
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
@@ -111,9 +115,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\Qt
-          key: windows-qt-${{ steps.qt.outputs.version }}-msvc2022-x64
+          key: windows-qt-6.10.3-msvc2022-x64-v2
 
-      # 10. 安装 Qt
+      # 10. 安装 Qt 6.10.3
       - name: Install Qt
         if: steps.qt-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -121,12 +125,14 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           aqt install-qt windows desktop 6.10.3 win64_msvc2022_64 `
-            -m qtpositioning qttools `
+            -m qtpositioning `
             -O C:\Qt
 
           if ($LASTEXITCODE -ne 0) {
             throw "Qt 6.10.3 installation failed"
           }
+
+          Write-Host "Qt installation completed"
 
       # 11. 配置 Qt
       - name: Configure Qt
@@ -181,6 +187,9 @@ jobs:
           Write-Host "===== aqtinstall ====="
           aqt version
 
+          Write-Host "===== Qt Directory ====="
+          Get-ChildItem $env:QT_ROOT
+
       # 14. 编译 Ladybird
       - name: Build Ladybird
         shell: pwsh
@@ -196,6 +205,7 @@ jobs:
             (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
           )
 
+          # 根据 CPU 和内存自动计算并行任务
           $jobs = [math]::Min(
             $cpu,
             [math]::Max(1, [math]::Floor($memory / 3))
@@ -232,10 +242,10 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
-          # 复制可执行文件
+          # 复制编译产物
           Copy-Item "$build\bin\*" $bin -Recurse -Force
 
-          # CMake 安装规则
+          # 执行 CMake 安装规则
           $install = Join-Path $env:RUNNER_TEMP "ladybird-install"
 
           New-Item -ItemType Directory -Force -Path $install | Out-Null
@@ -245,7 +255,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Copy-Item "$install\*" $stage -Recurse -Force
           } else {
-            Write-Warning "CMake install failed; continuing with build output"
+            Write-Warning "CMake install failed; using build output"
           }
 
           # 收集 vcpkg DLL
@@ -273,7 +283,7 @@ jobs:
             }
           }
 
-          # Qt 运行库部署
+          # 部署 Qt 运行库
           $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
 
           $mainExe = Join-Path $bin "Ladybird.exe"
