@@ -29,48 +29,46 @@ jobs:
           echo "Building Ladybird @ ${{ inputs.ref }}"
           git log -1 --oneline
 
-      # 【核心修复点】：必须先启动并配置 WSL2 环境
       - name: Setup WSL2 (Ubuntu)
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
-          # 可以直接在这里传入部分基础系统依赖，加速后续过程
           additional-packages: |
             autoconf autoconf-archive automake build-essential ccache cmake
             libtool nasm ninja-build pkg-config python3-venv
             qt6-base-dev qt6-tools-dev-tools qt6-wayland
             libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
 
-      - name: Verify WSL2
+      - name: Build inside WSL2 (as non-root user)
         shell: wsl-bash {0}
         run: |
-          echo "WSL environment is ready."
-          lsb_release -a
-          cmake --version
+          # 1. 创建普通用户 builder，并给予 sudo 权限
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-      - name: Build inside WSL2
-        shell: wsl-bash {0}
-        run: |
-          # 核心修复：使用 wslpath 将 Windows 路径转换为 WSL 能识别的 Linux 路径
+          # 2. 将代码从 Windows 慢速挂载盘复制到 WSL 原生极速盘
           WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
-          cd "$WORKSPACE_DIR"
+          echo "Source Windows Dir: $WORKSPACE_DIR"
           
-          # 从 Windows 挂载的文件默认没有执行权限，必须手动赋予
-          chmod +x Meta/ladybird.py
-          
-          # 执行官方推荐的构建脚本
-          ./Meta/ladybird.py build --preset Release
+          mkdir -p /home/builder/ladybird
+          # 复制源码（包括隐藏文件如 .gitignore，但不复制可能存在的 Build 目录）
+          cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
+          cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
 
-      - name: Package binary (Linux ELF)
-        shell: wsl-bash {0}
-        run: |
-          WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
-          cd "$WORKSPACE_DIR"
+          # 3. 更改目录所有权给 builder 用户
+          chown -R builder:builder /home/builder/ladybird
+
+          # 4. 切换到普通用户进行编译 (解决 root 报错)
+          cd /home/builder/ladybird
+          su builder -c "chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release"
+
+          # 5. 编译成功，将产物拷回 GitHub 工作区
+          mkdir -p "$WORKSPACE_DIR/dist"
+          cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
+          chmod -R 777 "$WORKSPACE_DIR/dist" # 确保宿主机有权限读取
           
-          mkdir -p dist
-          cp -R Build/release/bin dist/
           echo "=== 检查生成的产物架构 ==="
-          file dist/bin/Ladybird
+          file "$WORKSPACE_DIR/dist/bin/Ladybird"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
