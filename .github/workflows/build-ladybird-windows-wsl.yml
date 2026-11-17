@@ -11,8 +11,9 @@ on:
 
 jobs:
   build:
+    # 使用自带 WSL2 环境的 Windows 运行器
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout Ladybird source
@@ -23,26 +24,44 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup WSL2 (Ubuntu)
-        uses: Vampire/setup-wsl@v3
-        with:
-          distribution: Ubuntu-22.04
-          additional-packages: |
-            autoconf autoconf-archive automake build-essential ccache cmake
-            libtool nasm ninja-build pkg-config python3-venv qt6-base-dev
-            qt6-tools-dev-tools qt6-wayland tar unzip zip libpulse-dev
+      - name: Show selected ref
+        shell: bash
+        run: |
+          echo "Building Ladybird @ ${{ inputs.ref }}"
+          git log -1 --oneline
+
+      - name: Install dependencies in WSL2
+        shell: wsl-bash {0}
+        run: |
+          # 更新包管理器并安装官方要求的 Linux 构建依赖
+          sudo apt-get update
+          sudo apt-get install -y autoconf autoconf-archive automake \
+            build-essential ccache cmake libtool nasm ninja-build pkg-config \
+            python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
+            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
 
       - name: Build inside WSL2
         shell: wsl-bash {0}
         run: |
-          cd /mnt/${{ github.workspace }}
+          # 核心修复：使用 wslpath 将 Windows 路径转换为 WSL 能识别的 Linux 路径
+          WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
+          cd "$WORKSPACE_DIR"
+          
+          # 从 Windows 挂载的文件默认没有执行权限，必须手动赋予
+          chmod +x Meta/ladybird.py
+          
+          # 执行官方推荐的构建脚本
           ./Meta/ladybird.py build --preset Release
 
       - name: Package binary (Linux ELF)
         shell: wsl-bash {0}
         run: |
+          WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
+          cd "$WORKSPACE_DIR"
+          
           mkdir -p dist
           cp -R Build/release/bin dist/
+          echo "=== 检查生成的产物架构 ==="
           file dist/bin/Ladybird
 
       - name: Upload artifact
@@ -51,3 +70,4 @@ jobs:
           name: ladybird-wsl2-linux-${{ inputs.ref }}-${{ github.run_number }}
           path: dist/
           if-no-files-found: error
+          retention-days: 14
