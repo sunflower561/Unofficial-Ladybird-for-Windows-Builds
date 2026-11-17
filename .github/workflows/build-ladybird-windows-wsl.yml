@@ -1,4 +1,4 @@
-name: Build Ladybird Windows (WSL2, Official)
+name: Build Ladybird Windows (WSL2, Fast Cache)
 
 on:
   workflow_dispatch:
@@ -23,60 +23,104 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show selected ref
-        shell: bash
+      # 🚀 1. 恢复缓存（存放到 Windows 侧，方便 GitHub 提取）
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: .ladybird-cache/vcpkg_installed
+          key: wsl-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: wsl-vcpkg-
+
+      - name: Restore ccache cache
+        uses: actions/cache@v4
+        with:
+          path: .ladybird-cache/ccache
+          key: wsl-ccache-${{ hashFiles('vcpkg.json') }}
+          restore-keys: wsl-ccache-
+
+      # 确保缓存目录存在
+      - name: Prepare cache directories
         run: |
-          echo "Building Ladybird @ ${{ inputs.ref }}"
-          git log -1 --oneline
+          mkdir -p .ladybird-cache/vcpkg_installed
+          mkdir -p .ladybird-cache/ccache
 
       - name: Setup WSL2 (Ubuntu)
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
 
-      - name: Build inside WSL2 (as non-root user)
+      - name: Build inside WSL2 (Optimized)
         shell: wsl-bash {0}
         run: |
-          echo "=== [Step 1] 创建普通用户 builder ==="
+          # 1. 创建用户
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-          echo "=== [Step 2] 安装基础依赖和 FFmpeg 必需的硬件加速开发库 ==="
-          sudo apt-get -o Acquire::http::Timeout=30 update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=30 install -y \
+          # 2. 安装最新版 CMake 和 Make
+          echo "=== Installing build tools ==="
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             curl zip unzip tar git autoconf autoconf-archive automake \
-            build-essential ccache cmake libtool nasm ninja-build pkg-config \
+            build-essential ccache libtool nasm ninja-build pkg-config \
             python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
             libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
             libxkbcommon-dev libdrm-dev libvulkan-dev glslang-tools fonts-liberation2 \
-            libva-dev libvdpau-dev software-properties-common wget
+            software-properties-common wget rsync
 
-          echo "=== [Step 3] 安装 Clang 19 ==="
+          # 安装 Clang 19
           wget --timeout=30 --tries=3 -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           sudo add-apt-repository -y "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main"
-          sudo apt-get -o Acquire::http::Timeout=30 update -y
-          sudo apt-get -o Acquire::http::Timeout=30 install -y clang-19 lld-19
+          sudo apt-get update -y
+          sudo apt-get install -y clang-19 lld-19
 
-          echo "=== [Step 4] 复制代码并配置权限 ==="
+          # 安装 CMake 3.30
+          wget -q https://github.com/Kitware/CMake/releases/download/v3.30.2/cmake-3.30.2-linux-x86_64.tar.gz
+          tar -xzf cmake-3.30.2-linux-x86_64.tar.gz && sudo mv cmake-3.30.2-linux-x86_64 /opt/cmake
+          sudo ln -sf /opt/cmake/bin/* /usr/local/bin/
+
+          # 安装 Make 4.4
+          wget -q https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
+          tar -xzf make-4.4.tar.gz && cd make-4.4
+          ./configure --prefix=/usr/local && make -j4 && sudo make install
+          cd ..
+
+          # 3. 路径准备：将代码拉取到 WSL 的极速原生盘 (/home/builder/ladybird)
           WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
+          CACHE_DIR=$(wslpath '${{ github.workspace }}/.ladybird-cache')
+          
           mkdir -p /home/builder/ladybird
           cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
           cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
           chown -R builder:builder /home/builder/ladybird
 
-          echo "=== [Step 5] 清理可能的脏缓存 ==="
+          # 4. 核心：将 Windows 侧恢复的缓存，极速同步到 WSL 原生盘
+          echo "=== Syncing caches to WSL native disk ==="
+          mkdir -p /home/builder/ladybird/Build/release/vcpkg_installed
+          mkdir -p /home/builder/ladybird/.ccache
+          
+          if [ -d "$CACHE_DIR/vcpkg_installed" ] && [ "$(ls -A "$CACHE_DIR/vcpkg_installed")" ]; then
+            rsync -a "$CACHE_DIR/vcpkg_installed/" /home/builder/ladybird/Build/release/vcpkg_installed/
+          fi
+          if [ -d "$CACHE_DIR/ccache" ] && [ "$(ls -A "$CACHE_DIR/ccache")" ]; then
+            rsync -a "$CACHE_DIR/ccache/" /home/builder/ladybird/.ccache/
+          fi
+          chown -R builder:builder /home/builder/ladybird/Build
+          chown -R builder:builder /home/builder/ladybird/.ccache
+
+          # 5. 开始编译
+          echo "=== Starting Build ==="
           cd /home/builder/ladybird
           su builder -c "git config --global --add safe.directory '*'"
-          rm -rf Build/release/vcpkg-deps/ffmpeg
-          rm -rf Build/vcpkg-release/downloads/ffmpeg-ffmpeg-n9.0.2.tar.gz
-
-          echo "=== [Step 6] 开始源码编译 (限制并发防 OOM) ==="
-          echo "WSL 分配到的 CPU 核心数: $(nproc)"
-          echo "WSL 分配到的内存总量: $(free -h | awk '/^Mem:/ {print $2}')"
           
-          su builder -c "env CC=clang-19 CXX=clang++-19 VCPKG_MAX_CONCURRENCY=4 CMAKE_BUILD_PARALLEL_LEVEL=4 bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
+          # 限制并发，防止 15G 内存 OOM
+          su builder -c "env CC=clang-19 CXX=clang++-19 CCACHE_DIR=/home/builder/ladybird/.ccache VCPKG_MAX_CONCURRENCY=4 CMAKE_BUILD_PARALLEL_LEVEL=4 bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
 
-          echo "=== [Step 7] 编译完成，打包产物 ==="
+          # 6. 将新编译的依赖和 ccache 同步回 Windows 盘（供下次缓存）
+          echo "=== Syncing caches back to Windows workspace ==="
+          rsync -a /home/builder/ladybird/Build/release/vcpkg_installed/ "$CACHE_DIR/vcpkg_installed/"
+          rsync -a /home/builder/ladybird/.ccache/ "$CACHE_DIR/ccache/"
+
+          # 7. 拷贝成品
           mkdir -p "$WORKSPACE_DIR/dist"
           cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
           chmod -R 777 "$WORKSPACE_DIR/dist"
@@ -88,4 +132,3 @@ jobs:
           name: ladybird-wsl2-linux-${{ inputs.ref }}-${{ github.run_number }}
           path: dist/
           if-no-files-found: error
-          retention-days: 14
