@@ -1,0 +1,53 @@
+name: Build Ladybird Windows (WSL2, Official)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ladybird 分支或标签（如 master）'
+        required: true
+        default: 'master'
+        type: string
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Ladybird source
+        uses: actions/checkout@v4
+        with:
+          repository: LadybirdBrowser/ladybird
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup WSL2 (Ubuntu)
+        uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: |
+            autoconf autoconf-archive automake build-essential ccache cmake
+            libtool nasm ninja-build pkg-config python3-venv qt6-base-dev
+            qt6-tools-dev-tools qt6-wayland tar unzip zip libpulse-dev
+
+      - name: Build inside WSL2
+        shell: wsl-bash {0}
+        run: |
+          cd /mnt/${{ github.workspace }}
+          ./Meta/ladybird.py build --preset Release
+
+      - name: Package binary (Linux ELF)
+        shell: wsl-bash {0}
+        run: |
+          mkdir -p dist
+          cp -R Build/release/bin dist/
+          file dist/bin/Ladybird
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-wsl2-linux-${{ inputs.ref }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
