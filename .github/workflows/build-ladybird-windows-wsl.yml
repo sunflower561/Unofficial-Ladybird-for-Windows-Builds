@@ -29,7 +29,6 @@ jobs:
           echo "Building Ladybird @ ${{ inputs.ref }}"
           git log -1 --oneline
 
-      # 去掉手动更新步骤，直接让官方 Action 拉起 Ubuntu 环境（不带任何包）
       - name: Setup WSL2 (Ubuntu)
         uses: Vampire/setup-wsl@v3
         with:
@@ -38,41 +37,43 @@ jobs:
       - name: Build inside WSL2 (as non-root user)
         shell: wsl-bash {0}
         run: |
-          # 1. 创建普通用户 builder，并给予 sudo 权限
+          # 1. 创建普通用户 builder
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-          # 2. 更新并安装所有依赖（加上 retry 防止网络波动）
+          # 2. 安装基础依赖
           echo "Installing dependencies..."
-          sudo apt-get update -y || sudo apt-get update -y
+          sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             curl zip unzip tar git autoconf autoconf-archive automake \
             build-essential ccache cmake libtool nasm ninja-build pkg-config \
             python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
             libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev software-properties-common wget
 
-          # 3. 将代码从 Windows 慢速挂载盘复制到 WSL 原生极速盘
+          # 3. 安装 Clang 19（解决 "clang 19 or higher" 报错）
+          echo "Installing Clang 19..."
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo add-apt-repository -y "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main"
+          sudo apt-get update -y
+          sudo apt-get install -y clang-19 lld-19
+
+          # 4. 将代码从 Windows 盘复制到极速盘
           WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
-          echo "Source Windows Dir: $WORKSPACE_DIR"
-          
           mkdir -p /home/builder/ladybird
           cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
           cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
-
-          # 4. 更改目录所有权给 builder 用户
           chown -R builder:builder /home/builder/ladybird
 
-          # 5. 切换到普通用户进行编译
+          # 5. 切换到普通用户，强制指定 Clang 19 进行编译
           cd /home/builder/ladybird
-          
-          # 告知 git 信任该目录
           su builder -c "git config --global --add safe.directory '*'"
           
-          # 开始编译
-          su builder -c "bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
+          echo "Starting Ladybird build with Clang 19..."
+          # 注入环境变量 CC 和 CXX，让 vcpkg 和 CMake 都使用 Clang 19
+          su builder -c "env CC=clang-19 CXX=clang++-19 bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
 
-          # 6. 编译成功，将产物拷回 GitHub 工作区
+          # 6. 拷贝产物
           mkdir -p "$WORKSPACE_DIR/dist"
           cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
           chmod -R 777 "$WORKSPACE_DIR/dist"
