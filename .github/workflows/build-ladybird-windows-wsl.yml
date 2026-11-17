@@ -24,7 +24,7 @@ jobs:
       VCPKG_DOWNLOADS: ${{ github.workspace }}\.cache\vcpkg-downloads
 
     steps:
-      # 1. 获取指定分支源码
+      # 1. 获取 Ladybird 源码
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
@@ -40,7 +40,7 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      # 3. 配置 MSVC x64 编译环境
+      # 3. 配置 MSVC x64 环境
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -61,11 +61,17 @@ jobs:
           $llvm = "C:\Program Files\LLVM\bin"
 
           if (Test-Path $llvm) {
-            Add-Content $env:GITHUB_PATH $llvm
+            $llvm >> $env:GITHUB_PATH
+            $env:PATH = "$llvm;$env:PATH"
           }
 
+          Write-Host "===== LLVM ====="
           clang-cl --version
+
+          Write-Host "===== NASM ====="
           nasm -v
+
+          Write-Host "===== MSVC ====="
           cl
 
       # 5. 安装 CMake、Ninja、aqtinstall
@@ -75,21 +81,42 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           python -m pip install --upgrade pip
+
           if ($LASTEXITCODE -ne 0) {
             throw "pip upgrade failed"
           }
 
           python -m pip install --upgrade cmake ninja aqtinstall
+
           if ($LASTEXITCODE -ne 0) {
             throw "Python dependencies installation failed"
           }
 
-          python --version
+          # 获取 Python Scripts 目录
+          $scripts = (
+            python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          ).Trim()
+
+          if (!(Test-Path $scripts)) {
+            throw "Python Scripts directory not found: $scripts"
+          }
+
+          # 加入当前步骤和后续步骤 PATH
+          $scripts >> $env:GITHUB_PATH
+          $env:PATH = "$scripts;$env:PATH"
+
+          Write-Host "Python Scripts: $scripts"
+
+          Write-Host "===== CMake ====="
           cmake --version
+
+          Write-Host "===== Ninja ====="
           ninja --version
+
+          Write-Host "===== aqtinstall ====="
           aqt version
 
-      # 6. 安装 Rust stable
+      # 6. 安装 Rust
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -97,7 +124,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      # 8. 固定 Qt 版本
+      # 8. 设置 Qt 版本
       - name: Select Qt version
         id: qt
         shell: pwsh
@@ -107,7 +134,7 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "QT_VERSION=$version" >> $env:GITHUB_ENV
 
-          Write-Host "Selected Qt version: $version"
+          Write-Host "Qt version: $version"
 
       # 9. 缓存 Qt
       - name: Cache Qt
@@ -117,7 +144,7 @@ jobs:
           path: C:\Qt
           key: windows-qt-6.10.3-msvc2022-x64-v2
 
-      # 10. 安装 Qt 6.10.3
+      # 10. 安装 Qt
       - name: Install Qt
         if: steps.qt-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -134,7 +161,7 @@ jobs:
 
           Write-Host "Qt installation completed"
 
-      # 11. 配置 Qt
+      # 11. 配置 Qt 环境
       - name: Configure Qt
         shell: pwsh
         run: |
@@ -161,7 +188,33 @@ jobs:
           restore-keys: |
             windows-vcpkg-
 
-      # 13. 检查编译环境
+      # 13. 创建 vcpkg 缓存目录
+      - name: Prepare vcpkg cache directories
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cache = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg"
+          $downloads = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg-downloads"
+
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
+          "VCPKG_DOWNLOADS=$downloads" >> $env:GITHUB_ENV
+
+          if (!(Test-Path $cache -PathType Container)) {
+            throw "vcpkg binary cache directory creation failed"
+          }
+
+          if (!(Test-Path $downloads -PathType Container)) {
+            throw "vcpkg downloads directory creation failed"
+          }
+
+          Write-Host "vcpkg cache: $cache"
+          Write-Host "vcpkg downloads: $downloads"
+
+      # 14. 检查所有编译环境
       - name: Verify build environment
         shell: pwsh
         run: |
@@ -175,6 +228,13 @@ jobs:
           cmake --version
 
           Write-Host "===== Ninja ====="
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+
+          if (!$ninja) {
+            throw "Ninja executable not found in PATH"
+          }
+
+          Write-Host "Ninja path: $($ninja.Source)"
           ninja --version
 
           Write-Host "===== Rust ====="
@@ -187,10 +247,19 @@ jobs:
           Write-Host "===== aqtinstall ====="
           aqt version
 
-          Write-Host "===== Qt Directory ====="
-          Get-ChildItem $env:QT_ROOT
+          Write-Host "===== vcpkg cache ====="
 
-      # 14. 编译 Ladybird
+          if (!(Test-Path $env:VCPKG_DEFAULT_BINARY_CACHE -PathType Container)) {
+            throw "vcpkg binary cache directory missing"
+          }
+
+          if (!(Test-Path $env:VCPKG_DOWNLOADS -PathType Container)) {
+            throw "vcpkg downloads directory missing"
+          }
+
+          Write-Host "vcpkg cache ready"
+
+      # 15. 编译 Ladybird
       - name: Build Ladybird
         shell: pwsh
         env:
@@ -199,13 +268,27 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          # 再次确认 Ninja
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+
+          if (!$ninja) {
+            throw "Ninja is unavailable before compilation"
+          }
+
+          # 确保 vcpkg 缓存目录存在
+          New-Item -ItemType Directory -Force `
+            -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+
+          New-Item -ItemType Directory -Force `
+            -Path $env:VCPKG_DOWNLOADS | Out-Null
+
+          # 自动计算并行任务
           $cpu = [Environment]::ProcessorCount
 
           $memory = [math]::Floor(
             (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
           )
 
-          # 根据 CPU 和内存自动计算并行任务
           $jobs = [math]::Min(
             $cpu,
             [math]::Max(1, [math]::Floor($memory / 3))
@@ -214,11 +297,14 @@ jobs:
           $env:CMAKE_BUILD_PARALLEL_LEVEL = "$jobs"
           $env:VCPKG_MAX_CONCURRENCY = "$jobs"
 
+          Write-Host "===== Build Configuration ====="
           Write-Host "CPU cores: $cpu"
           Write-Host "Memory: $memory GB"
           Write-Host "Parallel jobs: $jobs"
+          Write-Host "Ninja: $($ninja.Source)"
+          Write-Host "vcpkg cache: $env:VCPKG_DEFAULT_BINARY_CACHE"
 
-          Write-Host "===== Start Ladybird Release Build ====="
+          Write-Host "===== Start Ladybird Build ====="
 
           py Meta\ladybird.py build
 
@@ -226,7 +312,7 @@ jobs:
             throw "Ladybird compilation failed: $LASTEXITCODE"
           }
 
-      # 15. 收集编译产物
+      # 16. 收集编译产物
       - name: Package Ladybird
         shell: pwsh
         run: |
@@ -242,7 +328,7 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
-          # 复制编译产物
+          # 复制编译目录
           Copy-Item "$build\bin\*" $bin -Recurse -Force
 
           # 执行 CMake 安装规则
@@ -266,7 +352,7 @@ jobs:
               Copy-Item -Destination $bin -Force
           }
 
-          # 收集资源目录
+          # 收集可能存在的资源目录
           $resourceDirs = @(
             "share",
             "res",
@@ -283,9 +369,7 @@ jobs:
             }
           }
 
-          # 部署 Qt 运行库
-          $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
-
+          # 查找 Ladybird.exe
           $mainExe = Join-Path $bin "Ladybird.exe"
 
           if (!(Test-Path $mainExe)) {
@@ -295,9 +379,12 @@ jobs:
             if ($found) {
               $mainExe = $found.FullName
             } else {
-              throw "Ladybird.exe not found"
+              throw "Ladybird.exe not found in build output"
             }
           }
+
+          # 部署 Qt 运行库
+          $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
 
           if (!(Test-Path $windeployqt)) {
             throw "windeployqt.exe not found"
@@ -314,7 +401,7 @@ jobs:
           Get-ChildItem $stage -Recurse -File |
             Select-Object FullName, Length
 
-      # 16. 创建 ZIP
+      # 17. 创建 ZIP
       - name: Create Windows ZIP
         shell: pwsh
         run: |
@@ -351,9 +438,13 @@ jobs:
             )
           }
 
+          if (!(Test-Path $zip)) {
+            throw "ZIP file was not created"
+          }
+
           Get-Item $zip | Select-Object Name, Length
 
-      # 17. 上传 ZIP
+      # 18. 上传编译产物
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
