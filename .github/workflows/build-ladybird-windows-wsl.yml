@@ -11,7 +11,6 @@ on:
 
 jobs:
   build:
-    # 使用自带 WSL2 环境的 Windows 运行器
     runs-on: windows-latest
     timeout-minutes: 240
 
@@ -30,15 +29,24 @@ jobs:
           echo "Building Ladybird @ ${{ inputs.ref }}"
           git log -1 --oneline
 
-      - name: Install dependencies in WSL2
+      # 【核心修复点】：必须先启动并配置 WSL2 环境
+      - name: Setup WSL2 (Ubuntu)
+        uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          # 可以直接在这里传入部分基础系统依赖，加速后续过程
+          additional-packages: |
+            autoconf autoconf-archive automake build-essential ccache cmake
+            libtool nasm ninja-build pkg-config python3-venv
+            qt6-base-dev qt6-tools-dev-tools qt6-wayland
+            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
+
+      - name: Verify WSL2
         shell: wsl-bash {0}
         run: |
-          # 更新包管理器并安装官方要求的 Linux 构建依赖
-          sudo apt-get update
-          sudo apt-get install -y autoconf autoconf-archive automake \
-            build-essential ccache cmake libtool nasm ninja-build pkg-config \
-            python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
-            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
+          echo "WSL environment is ready."
+          lsb_release -a
+          cmake --version
 
       - name: Build inside WSL2
         shell: wsl-bash {0}
