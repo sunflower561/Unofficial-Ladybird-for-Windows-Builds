@@ -33,10 +33,12 @@ jobs:
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
+          # 【关键修复 1】：补充 vcpkg 引导必须的基础工具 (curl, unzip, zip, tar)
           additional-packages: |
-            autoconf autoconf-archive automake build-essential ccache cmake
-            libtool nasm ninja-build pkg-config python3-venv
-            qt6-base-dev qt6-tools-dev-tools qt6-wayland
+            curl zip unzip tar git \
+            autoconf autoconf-archive automake build-essential ccache cmake \
+            libtool nasm ninja-build pkg-config python3-venv \
+            qt6-base-dev qt6-tools-dev-tools qt6-wayland \
             libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
 
       - name: Build inside WSL2 (as non-root user)
@@ -51,16 +53,20 @@ jobs:
           echo "Source Windows Dir: $WORKSPACE_DIR"
           
           mkdir -p /home/builder/ladybird
-          # 复制源码（包括隐藏文件如 .gitignore，但不复制可能存在的 Build 目录）
           cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
           cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
 
           # 3. 更改目录所有权给 builder 用户
           chown -R builder:builder /home/builder/ladybird
 
-          # 4. 切换到普通用户进行编译 (解决 root 报错)
+          # 4. 切换到普通用户进行编译
           cd /home/builder/ladybird
-          su builder -c "chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release"
+          
+          # 【关键修复 2】：告知 git 信任该目录，防止子模块报 dubious ownership 错误
+          su builder -c "git config --global --add safe.directory '*'"
+          
+          # 【关键修复 3】：使用 bash -l -c 确保环境变量正确加载，并实时输出 vcpkg 日志
+          su builder -c "bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
 
           # 5. 编译成功，将产物拷回 GitHub 工作区
           mkdir -p "$WORKSPACE_DIR/dist"
