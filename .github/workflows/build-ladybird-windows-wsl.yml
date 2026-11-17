@@ -3,11 +3,12 @@ name: Build Ladybird Windows x64
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: "0 3 * * 0"
+    inputs:
+      source_branch:
+        description: "Ladybird source branch"
+        required: true
+        default: "master"
+        type: string
 
 permissions:
   contents: read
@@ -23,12 +24,12 @@ jobs:
       VCPKG_DOWNLOADS: ${{ github.workspace }}\.cache\vcpkg-downloads
 
     steps:
-      # 1. 获取源码
+      # 1. 获取 Ladybird 源码
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
           repository: LadybirdBrowser/ladybird
-          ref: master
+          ref: ${{ inputs.source_branch }}
           submodules: recursive
           fetch-depth: 0
 
@@ -39,19 +40,20 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      # 3. 配置 Visual Studio C++ 编译环境
+      # 3. MSVC 编译环境
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # 4. 安装最新稳定版 LLVM、NASM 和 pkg-config
+      # 4. 安装 LLVM、NASM、pkg-config
       - name: Install build tools
         shell: pwsh
         run: |
           choco install llvm nasm pkgconfiglite -y --no-progress
 
           $llvm = "C:\Program Files\LLVM\bin"
+
           if (Test-Path $llvm) {
             Add-Content $env:GITHUB_PATH $llvm
           }
@@ -60,7 +62,7 @@ jobs:
           nasm -v
           cl
 
-      # 5. 安装 CMake、Ninja 和 aqtinstall
+      # 5. 安装 CMake、Ninja
       - name: Install Python build dependencies
         shell: pwsh
         run: |
@@ -75,10 +77,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # 7. Rust 缓存
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      # 7. 查询 Qt 最新稳定版
+      # 8. 查询最新 Qt 稳定版
       - name: Find latest Qt version
         id: qt
         shell: pwsh
@@ -95,7 +98,7 @@ jobs:
 
           Write-Host "Qt version: $version"
 
-      # 8. 缓存 Qt
+      # 9. 缓存 Qt
       - name: Cache Qt
         id: qt-cache
         uses: actions/cache@v4
@@ -103,7 +106,7 @@ jobs:
           path: C:\Qt
           key: windows-qt-${{ steps.qt.outputs.version }}-msvc2022-x64
 
-      # 9. 安装 Qt
+      # 10. 安装 Qt
       - name: Install Qt
         if: steps.qt-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -112,7 +115,7 @@ jobs:
             -m qtpositioning qttools `
             -O C:\Qt
 
-      # 10. 配置 Qt 环境
+      # 11. 配置 Qt
       - name: Configure Qt
         shell: pwsh
         run: |
@@ -126,9 +129,7 @@ jobs:
           "CMAKE_PREFIX_PATH=$qt" >> $env:GITHUB_ENV
           "$qt\bin" >> $env:GITHUB_PATH
 
-          Write-Host "Qt root: $qt"
-
-      # 11. 缓存 vcpkg 二进制依赖
+      # 12. 缓存 vcpkg
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
@@ -139,7 +140,7 @@ jobs:
           restore-keys: |
             windows-vcpkg-
 
-      # 12. 编译 Ladybird
+      # 13. 编译 Ladybird
       - name: Build Ladybird
         shell: pwsh
         env:
@@ -149,11 +150,11 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $cpu = [Environment]::ProcessorCount
+
           $memory = [math]::Floor(
             (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
           )
 
-          # 根据 CPU 和内存自动设置并行任务数
           $jobs = [math]::Min(
             $cpu,
             [math]::Max(1, [math]::Floor($memory / 3))
@@ -166,15 +167,13 @@ jobs:
           Write-Host "Memory: $memory GB"
           Write-Host "Build jobs: $jobs"
 
-          Write-Host "Starting Ladybird Release build..."
-
           py Meta\ladybird.py build
 
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird compilation failed: $LASTEXITCODE"
           }
 
-      # 13. 收集 Windows 发布文件
+      # 14. 收集编译产物
       - name: Package Ladybird
         shell: pwsh
         run: |
@@ -185,16 +184,17 @@ jobs:
           $bin = Join-Path $stage "bin"
 
           if (!(Test-Path "$build\bin")) {
-            throw "找不到 Build\release\bin，编译产物不存在"
+            throw "找不到 Build\release\bin"
           }
 
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
-          # 复制可执行文件
+          # 复制可执行文件和构建产物
           Copy-Item "$build\bin\*" $bin -Recurse -Force
 
-          # 尝试执行 CMake 安装规则，补齐安装资源
+          # 尝试使用 CMake 安装规则
           $install = Join-Path $env:RUNNER_TEMP "ladybird-install"
+
           New-Item -ItemType Directory -Force -Path $install | Out-Null
 
           cmake --install $build --prefix $install
@@ -202,10 +202,10 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Copy-Item "$install\*" $stage -Recurse -Force
           } else {
-            Write-Warning "CMake install 未成功，继续收集 Build 目录产物"
+            Write-Warning "CMake install 未成功，继续收集构建目录产物"
           }
 
-          # 收集 vcpkg 运行时 DLL
+          # 收集 vcpkg DLL
           $vcpkgBin = "$build\vcpkg_installed\x64-windows\bin"
 
           if (Test-Path $vcpkgBin) {
@@ -213,7 +213,7 @@ jobs:
               Copy-Item -Destination $bin -Force
           }
 
-          # 复制构建目录中的资源文件
+          # 收集可能存在的资源目录
           $resourceDirs = @(
             "share",
             "res",
@@ -230,7 +230,7 @@ jobs:
             }
           }
 
-          # 使用 windeployqt 收集 Qt 运行库和插件
+          # Qt 运行库部署
           $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
           $mainExe = Join-Path $bin "Ladybird.exe"
 
@@ -245,21 +245,21 @@ jobs:
             }
           }
 
-          if (Test-Path $windeployqt) {
-            & $windeployqt --release --compiler-runtime --no-translations $mainExe
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "windeployqt 执行失败"
-            }
-          } else {
+          if (!(Test-Path $windeployqt)) {
             throw "找不到 windeployqt.exe"
           }
 
-          # 检查主程序
+          & $windeployqt --release --compiler-runtime --no-translations $mainExe
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt 执行失败"
+          }
+
+          Write-Host "Package files:"
           Get-ChildItem $stage -Recurse -File |
             Select-Object FullName, Length
 
-      # 14. 快速压缩 ZIP
+      # 15. 创建 ZIP
       - name: Create Windows ZIP
         shell: pwsh
         run: |
@@ -272,7 +272,6 @@ jobs:
             Remove-Item $zip -Force
           }
 
-          # 优先使用 7-Zip 的快速压缩模式
           $sevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
 
           if ($sevenZip) {
@@ -295,8 +294,8 @@ jobs:
 
           Get-Item $zip | Select-Object Name, Length
 
-      # 15. 上传 ZIP
-      - name: Upload Ladybird Windows ZIP
+      # 16. 上传 ZIP
+      - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Ladybird-Windows-x64
