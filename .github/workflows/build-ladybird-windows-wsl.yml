@@ -29,48 +29,55 @@ jobs:
           echo "Building Ladybird @ ${{ inputs.ref }}"
           git log -1 --oneline
 
-      # ✅ 【新增修复步骤】：手动更新 WSL 并检查状态
-      - name: Fix and Update WSL
-        shell: pwsh
-        run: |
-          # 尝试更新 WSL，解决潜在的环境损坏问题
-          wsl --update --web-download
-          # 输出 WSL 状态，方便确认
-          wsl --status
-          wsl --list --verbose
-
+      # 去掉手动更新步骤，直接让官方 Action 拉起 Ubuntu 环境（不带任何包）
       - name: Setup WSL2 (Ubuntu)
         uses: Vampire/setup-wsl@v3
         with:
           distribution: Ubuntu-22.04
-          additional-packages: |
-            curl zip unzip tar git \
-            autoconf autoconf-archive automake build-essential ccache cmake \
-            libtool nasm ninja-build pkg-config python3-venv \
-            qt6-base-dev qt6-tools-dev-tools qt6-wayland \
-            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev libxkbcommon-dev
 
       - name: Build inside WSL2 (as non-root user)
         shell: wsl-bash {0}
         run: |
+          # 1. 创建普通用户 builder，并给予 sudo 权限
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+          # 2. 更新并安装所有依赖（加上 retry 防止网络波动）
+          echo "Installing dependencies..."
+          sudo apt-get update -y || sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            curl zip unzip tar git autoconf autoconf-archive automake \
+            build-essential ccache cmake libtool nasm ninja-build pkg-config \
+            python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
+            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
+            libxkbcommon-dev
+
+          # 3. 将代码从 Windows 慢速挂载盘复制到 WSL 原生极速盘
           WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
           echo "Source Windows Dir: $WORKSPACE_DIR"
           
           mkdir -p /home/builder/ladybird
           cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
           cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
+
+          # 4. 更改目录所有权给 builder 用户
           chown -R builder:builder /home/builder/ladybird
 
+          # 5. 切换到普通用户进行编译
           cd /home/builder/ladybird
+          
+          # 告知 git 信任该目录
           su builder -c "git config --global --add safe.directory '*'"
+          
+          # 开始编译
           su builder -c "bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
 
+          # 6. 编译成功，将产物拷回 GitHub 工作区
           mkdir -p "$WORKSPACE_DIR/dist"
           cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
           chmod -R 777 "$WORKSPACE_DIR/dist"
+          
+          echo "=== 检查生成的产物架构 ==="
           file "$WORKSPACE_DIR/dist/bin/Ladybird"
 
       - name: Upload artifact
