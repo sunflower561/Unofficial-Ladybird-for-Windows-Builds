@@ -24,7 +24,7 @@ jobs:
       VCPKG_DOWNLOADS: ${{ github.workspace }}\.cache\vcpkg-downloads
 
     steps:
-      # 1. 获取指定分支的 Ladybird 源码
+      # 1. 获取指定分支源码
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
@@ -83,7 +83,7 @@ jobs:
           python --version
           cmake --version
           ninja --version
-          aqt --version
+          aqt version
 
       # 6. 安装 Rust stable
       - name: Install Rust stable
@@ -113,7 +113,7 @@ jobs:
           path: C:\Qt
           key: windows-qt-${{ steps.qt.outputs.version }}-msvc2022-x64
 
-      # 10. 安装 Qt 6.10.3
+      # 10. 安装 Qt
       - name: Install Qt
         if: steps.qt-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -128,7 +128,7 @@ jobs:
             throw "Qt 6.10.3 installation failed"
           }
 
-      # 11. 配置 Qt 环境
+      # 11. 配置 Qt
       - name: Configure Qt
         shell: pwsh
         run: |
@@ -144,7 +144,7 @@ jobs:
 
           Write-Host "Qt configured: $qt"
 
-      # 12. 缓存 vcpkg 下载和二进制依赖
+      # 12. 缓存 vcpkg
       - name: Cache vcpkg
         uses: actions/cache@v4
         with:
@@ -159,6 +159,8 @@ jobs:
       - name: Verify build environment
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "===== Compiler ====="
           clang-cl --version
           cl
@@ -176,6 +178,9 @@ jobs:
           Write-Host "===== Qt ====="
           qmake --version
 
+          Write-Host "===== aqtinstall ====="
+          aqt version
+
       # 14. 编译 Ladybird
       - name: Build Ladybird
         shell: pwsh
@@ -191,7 +196,6 @@ jobs:
             (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
           )
 
-          # 自动计算并行任务数
           $jobs = [math]::Min(
             $cpu,
             [math]::Max(1, [math]::Floor($memory / 3))
@@ -212,7 +216,7 @@ jobs:
             throw "Ladybird compilation failed: $LASTEXITCODE"
           }
 
-      # 15. 收集编译文件
+      # 15. 收集编译产物
       - name: Package Ladybird
         shell: pwsh
         run: |
@@ -231,7 +235,7 @@ jobs:
           # 复制可执行文件
           Copy-Item "$build\bin\*" $bin -Recurse -Force
 
-          # 使用 CMake 安装规则收集文件
+          # CMake 安装规则
           $install = Join-Path $env:RUNNER_TEMP "ladybird-install"
 
           New-Item -ItemType Directory -Force -Path $install | Out-Null
@@ -252,7 +256,7 @@ jobs:
               Copy-Item -Destination $bin -Force
           }
 
-          # 收集构建目录中的资源文件
+          # 收集资源目录
           $resourceDirs = @(
             "share",
             "res",
@@ -269,7 +273,7 @@ jobs:
             }
           }
 
-          # 部署 Qt 运行库
+          # Qt 运行库部署
           $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
 
           $mainExe = Join-Path $bin "Ladybird.exe"
@@ -281,7 +285,7 @@ jobs:
             if ($found) {
               $mainExe = $found.FullName
             } else {
-              throw "Ladybird.exe not found in build output"
+              throw "Ladybird.exe not found"
             }
           }
 
@@ -339,7 +343,7 @@ jobs:
 
           Get-Item $zip | Select-Object Name, Length
 
-      # 17. 上传最终 ZIP
+      # 17. 上传 ZIP
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
