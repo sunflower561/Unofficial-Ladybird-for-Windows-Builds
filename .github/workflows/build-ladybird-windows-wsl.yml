@@ -1,21 +1,29 @@
-name: Build Ladybird Windows (WSL2, Optimized)
+
+name: Ladybird Windows x64 - Fast Build
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Ladybird 分支或标签（如 master）'
+        description: "Ladybird branch, tag or commit"
         required: true
-        default: 'master'
+        default: "master"
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
+
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.cache\vcpkg
 
     steps:
-      - name: Checkout Ladybird source
+      # 1. 获取源码
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           repository: LadybirdBrowser/ladybird
@@ -23,124 +31,285 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show selected ref
-        shell: bash
-        run: |
-          echo "Building Ladybird @ ${{ inputs.ref }}"
-          git log -1 --oneline
+      # 2. Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          check-latest: true
 
-      # 🚀 1. 恢复缓存（存放到 Windows 侧，方便 GitHub 提取）
-      - name: Restore vcpkg cache
+      # 3. Visual Studio x64
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # 4. 安装最新 LLVM / NASM / pkg-config
+      - name: Install LLVM
+        shell: pwsh
+        run: |
+          choco upgrade llvm -y --no-progress
+          choco upgrade nasm -y --no-progress
+          choco upgrade pkgconfiglite -y --no-progress
+
+          $llvm = "$env:ProgramFiles\LLVM\bin"
+          Add-Content $env:GITHUB_PATH $llvm
+
+      # 5. 最新 CMake / Ninja / aqtinstall
+      - name: Install Build Tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade `
+            pip setuptools wheel cmake ninja aqtinstall
+
+      # 6. Rust stable
+      - name: Setup Rust
+        uses: rust-lang/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 7. 查询最新 Qt 版本
+      - name: Detect Qt Version
+        id: qt
+        shell: pwsh
+        run: |
+          $raw = & aqt list-qt windows desktop | Out-String
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Qt version query failed."
+          }
+
+          $versions = [regex]::Matches(
+            $raw,
+            '(?<!\d)6\.\d+\.\d+(?!\d)'
+          ) |
+            ForEach-Object { [version]$_.Value } |
+            Sort-Object -Unique
+
+          if (!$versions) {
+            throw "No Qt 6 release found."
+          }
+
+          $version = $versions[-1].ToString()
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Qt version: $version"
+
+      # 8. 缓存 Qt
+      - name: Cache Qt
+        id: qt-cache
         uses: actions/cache@v4
         with:
-          path: .ladybird-cache/vcpkg_installed
-          key: wsl-vcpkg-${{ hashFiles('vcpkg.json') }}
-          restore-keys: wsl-vcpkg-
+          path: Qt
+          key: ladybird-qt-${{ steps.qt.outputs.version }}-msvc2022-x64
 
-      - name: Restore ccache cache
+      # 9. 安装 Qt（仅缓存未命中时）
+      - name: Install Qt
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          aqt install-qt `
+            windows desktop ${{ steps.qt.outputs.version }} win64_msvc2022_64 `
+            -m qtpositioning qttools `
+            -O "$env:GITHUB_WORKSPACE\Qt"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Qt installation failed."
+          }
+
+      # 10. 设置 Qt 路径
+      - name: Configure Qt
+        shell: pwsh
+        run: |
+          $qtRoot = "$env:GITHUB_WORKSPACE\Qt\${{ steps.qt.outputs.version }}\msvc2022_64"
+
+          if (!(Test-Path "$qtRoot\lib\cmake\Qt6\Qt6Config.cmake")) {
+            throw "Qt installation incomplete."
+          }
+
+          "QT_ROOT=$qtRoot" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$qtRoot" >> $env:GITHUB_ENV
+          "Qt6_DIR=$qtRoot\lib\cmake\Qt6" >> $env:GITHUB_ENV
+
+      # 11. 缓存 vcpkg 二进制包
+      - name: Cache vcpkg
         uses: actions/cache@v4
         with:
-          path: .ladybird-cache/ccache
-          key: wsl-ccache-${{ hashFiles('vcpkg.json') }}
-          restore-keys: wsl-ccache-
+          path: .cache/vcpkg
+          key: ladybird-vcpkg-win64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
+          restore-keys: |
+            ladybird-vcpkg-win64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            ladybird-vcpkg-win64-
 
-      # 确保缓存目录存在
-      - name: Prepare cache directories
-        run: |
-          mkdir -p .ladybird-cache/vcpkg_installed
-          mkdir -p .ladybird-cache/ccache
-
-      - name: Setup WSL2 (Ubuntu)
-        uses: Vampire/setup-wsl@v3
+      # 12. 缓存编译工具下载文件
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
         with:
-          distribution: Ubuntu-22.04
+          path: |
+            .cache/vcpkg-downloads
+          key: ladybird-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
+          restore-keys: |
+            ladybird-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
 
-      - name: Build inside WSL2 (Optimized)
-        shell: wsl-bash {0}
+      # 13. 编译
+      - name: Build Ladybird
+        shell: pwsh
+        env:
+          CC: clang-cl
+          CXX: clang-cl
         run: |
-          echo "=== [Step 1] 创建普通用户 builder ==="
-          useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+          $ErrorActionPreference = "Stop"
 
-          echo "=== [Step 2] 安装基础依赖和开发库 (补齐了 libssl 等) ==="
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            curl zip unzip tar git autoconf autoconf-archive automake \
-            build-essential ccache libtool nasm ninja-build pkg-config \
-            python3-venv qt6-base-dev qt6-tools-dev-tools qt6-wayland \
-            libpulse-dev libgl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
-            libxkbcommon-dev libdrm-dev libvulkan-dev glslang-tools fonts-liberation2 \
-            software-properties-common wget rsync \
-            libssl-dev libx11-dev libxcomposite-dev libxdamage-dev libxrandr-dev libncurses-dev
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:QT_ROOT\bin;$env:PATH"
 
-          echo "=== [Step 3] 安装 Clang 19 ==="
-          wget --timeout=30 --tries=3 -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          sudo add-apt-repository -y "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main"
-          sudo apt-get update -y
-          sudo apt-get install -y clang-19 lld-19
+          # 自动根据 CPU 和内存确定并发
+          $cpu = [Environment]::ProcessorCount
+          $memory = [math]::Floor(
+            (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+          )
 
-          echo "=== [Step 4] 手动安装 CMake 3.30+ ==="
-          wget -q https://github.com/Kitware/CMake/releases/download/v3.30.2/cmake-3.30.2-linux-x86_64.tar.gz
-          tar -xzf cmake-3.30.2-linux-x86_64.tar.gz
-          sudo mv cmake-3.30.2-linux-x86_64 /opt/cmake
-          sudo ln -sf /opt/cmake/bin/* /usr/local/bin/
+          $jobs = [math]::Min(
+            $cpu,
+            [math]::Max(1, [math]::Floor($memory / 3))
+          )
+
+          Write-Host "CPU cores: $cpu"
+          Write-Host "RAM: $memory GB"
+          Write-Host "Build jobs: $jobs"
+
+          $env:CMAKE_BUILD_PARALLEL_LEVEL = "$jobs"
+          $env:VCPKG_MAX_CONCURRENCY = "$jobs"
+
+          # vcpkg 下载缓存
+          $downloadCache = "$env:GITHUB_WORKSPACE\.cache\vcpkg-downloads"
+          New-Item -ItemType Directory -Force $downloadCache |
+            Out-Null
+
+          $env:VCPKG_DOWNLOADS = $downloadCache
+
+          # 工具链检查
+          clang-cl --version
           cmake --version
+          ninja --version
+          rustc --version
+          cargo --version
 
-          echo "=== [Step 5] 手动编译安装 Make 4.4+ ==="
-          wget -q https://ftp.gnu.org/gnu/make/make-4.4.tar.gz
-          tar -xzf make-4.4.tar.gz
-          cd make-4.4
-          ./configure --prefix=/usr/local
-          make -j$(nproc)
-          sudo make install
-          cd ..
-          make --version
+          # 正式构建
+          py Meta\ladybird.py build
 
-          echo "=== [Step 6] 复制代码并配置权限到 WSL 极速盘 ==="
-          WORKSPACE_DIR=$(wslpath '${{ github.workspace }}')
-          CACHE_DIR=$(wslpath '${{ github.workspace }}/.ladybird-cache')
-          
-          mkdir -p /home/builder/ladybird
-          cp -r "$WORKSPACE_DIR"/* /home/builder/ladybird/
-          cp -r "$WORKSPACE_DIR"/.[!.]* /home/builder/ladybird/ 2>/dev/null || true
-          chown -R builder:builder /home/builder/ladybird
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ladybird build failed."
+          }
 
-          echo "=== [Step 7] 清理脏缓存 ==="
-          cd /home/builder/ladybird
-          su builder -c "git config --global --add safe.directory '*'"
-          rm -rf Build/vcpkg-release/downloads/*
-          rm -rf Build/release/vcpkg-deps/*
+          if (!(Test-Path "Build\release\bin\Ladybird.exe")) {
+            throw "Ladybird.exe not found."
+          }
 
-          echo "=== [Step 8] 从 Windows 侧同步缓存到 WSL 原生盘 ==="
-          mkdir -p /home/builder/ladybird/Build/release/vcpkg_installed
-          mkdir -p /home/builder/ladybird/.ccache
-          
-          if [ -d "$CACHE_DIR/vcpkg_installed" ] && [ "$(ls -A "$CACHE_DIR/vcpkg_installed")" ]; then
-            rsync -a "$CACHE_DIR/vcpkg_installed/" /home/builder/ladybird/Build/release/vcpkg_installed/
-          fi
-          if [ -d "$CACHE_DIR/ccache" ] && [ "$(ls -A "$CACHE_DIR/ccache")" ]; then
-            rsync -a "$CACHE_DIR/ccache/" /home/builder/ladybird/.ccache/
-          fi
-          chown -R builder:builder /home/builder/ladybird/Build
-          chown -R builder:builder /home/builder/ladybird/.ccache
+      # 14. 准备发行目录
+      - name: Prepare Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          echo "=== [Step 9] 开始源码编译 (限制并发防 OOM) ==="
-          su builder -c "env CC=clang-19 CXX=clang++-19 CCACHE_DIR=/home/builder/ladybird/.ccache VCPKG_MAX_CONCURRENCY=4 CMAKE_BUILD_PARALLEL_LEVEL=4 bash -l -c 'chmod +x Meta/ladybird.py && ./Meta/ladybird.py build --preset Release'"
+          $source = "Build\release\bin"
+          $target = "dist\Ladybird-Windows-x64"
 
-          echo "=== [Step 10] 同步新缓存回 Windows 侧供 Actions 保存 ==="
-          rsync -a /home/builder/ladybird/Build/release/vcpkg_installed/ "$CACHE_DIR/vcpkg_installed/"
-          rsync -a /home/builder/ladybird/.ccache/ "$CACHE_DIR/ccache/"
+          New-Item -ItemType Directory -Force $target |
+            Out-Null
 
-          echo "=== [Step 11] 打包产物 ==="
-          mkdir -p "$WORKSPACE_DIR/dist"
-          cp -R Build/release/bin "$WORKSPACE_DIR/dist/"
-          chmod -R 777 "$WORKSPACE_DIR/dist"
-          file "$WORKSPACE_DIR/dist/bin/Ladybird"
+          Copy-Item "$source\*" $target -Recurse -Force
 
-      - name: Upload artifact
+          if (!(Test-Path "$target\Ladybird.exe")) {
+            throw "Ladybird.exe missing."
+          }
+
+      # 15. 收集第三方 DLL
+      - name: Collect Runtime DLLs
+        shell: pwsh
+        run: |
+          $target = "dist\Ladybird-Windows-x64"
+
+          $dirs = @(
+            "Build\release\vcpkg_installed\x64-windows\bin"
+          )
+
+          foreach ($dir in $dirs) {
+            if (Test-Path $dir) {
+              Get-ChildItem $dir -Filter *.dll -File |
+                Copy-Item -Destination $target -Force
+            }
+          }
+
+      # 16. 部署 Qt
+      - name: Deploy Qt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $deploy = "$env:QT_ROOT\bin\windeployqt.exe"
+          $app = "dist\Ladybird-Windows-x64\Ladybird.exe"
+
+          & $deploy `
+            --release `
+            --compiler-runtime `
+            --no-translations `
+            --dir "dist\Ladybird-Windows-x64" `
+            $app
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Qt deployment failed."
+          }
+
+      # 17. 验证文件
+      - name: Verify Package
+        shell: pwsh
+        run: |
+          $target = "dist\Ladybird-Windows-x64"
+
+          Get-ChildItem $target -Filter *.exe -Recurse
+          Get-ChildItem $target -Filter *.dll -Recurse
+
+          if (!(Test-Path "$target\Ladybird.exe")) {
+            throw "Missing executable."
+          }
+
+      # 18. 快速压缩 ZIP
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist |
+            Out-Null
+
+          $source = "dist\Ladybird-Windows-x64"
+          $zip = "dist\Ladybird-Windows-x64.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          if (Get-Command 7z -ErrorAction SilentlyContinue) {
+            7z a -tzip -mx=1 $zip "$source\*"
+          } else {
+            Compress-Archive `
+              -Path "$source\*" `
+              -DestinationPath $zip `
+              -CompressionLevel Fastest
+          }
+
+          if (!(Test-Path $zip)) {
+            throw "ZIP generation failed."
+          }
+
+          Get-Item $zip |
+            Select-Object Name, Length
+
+      # 19. 上传 ZIP
+      - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: ladybird-wsl2-linux-${{ inputs.ref }}-${{ github.run_number }}
-          path: dist/
+          name: Ladybird-Windows-x64
+          path: dist/Ladybird-Windows-x64.zip
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
