@@ -1,52 +1,38 @@
+
 name: Build Ladybird Windows x64
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird 分支 / Tag / Commit"
+        description: "Ladybird source branch / tag / commit"
         required: true
         default: "master"
         type: string
 
-      build_type:
-        description: "Build type"
-        required: true
-        default: "Release"
-        type: choice
-        options:
-          - Release
-          - RelWithDebInfo
-
       publish_release:
-        description: "发布 GitHub Release"
+        description: "Publish GitHub Pre-release"
         required: true
         default: true
         type: boolean
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build Ladybird Windows x64
+    name: Windows x64 Build
     runs-on: windows-2025
-
     timeout-minutes: 360
 
-    permissions:
-      contents: write
-
     env:
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\.cache\\vcpkg,readwrite"
-      VCPKG_DEFAULT_BINARY_CACHE: "${{ github.workspace }}\\.cache\\vcpkg"
-      VCPKG_MAX_CONCURRENCY: "8"
-      CMAKE_BUILD_PARALLEL_LEVEL: "8"
-      RUSTUP_TOOLCHAIN: "stable-x86_64-pc-windows-msvc"
+      VCPKG_MAX_CONCURRENCY: "4"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
     steps:
-
-      # ============================================================
-      # 1. Checkout
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 1. 获取 Ladybird 源码
+      # ------------------------------------------------------------
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
@@ -58,428 +44,220 @@ jobs:
       - name: Show source revision
         shell: pwsh
         run: |
-          Write-Host "========================================"
-          Write-Host "Ladybird source"
-          Write-Host "========================================"
-
+          $ErrorActionPreference = "Stop"
+          Write-Host "Requested ref: ${{ inputs.ref }}"
+          Write-Host "Actual commit:"
+          git rev-parse HEAD
           git log -1 --oneline
 
-          Write-Host ""
-          Write-Host "Requested ref:"
-          Write-Host "${{ inputs.ref }}"
-
-      # ============================================================
-      # 2. Prepare cache
-      # ============================================================
-
-      - name: Prepare cache directories
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force ".cache\vcpkg" | Out-Null
-          New-Item -ItemType Directory -Force ".cache\ccache" | Out-Null
-
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
-        with:
-          path: .cache\vcpkg
-          key: windows-vcpkg-${{ runner.arch }}-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('Meta/CMake/vcpkg/**') }}
-          restore-keys: |
-            windows-vcpkg-${{ runner.arch }}-
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: .cache\ccache
-          key: windows-ccache-${{ runner.arch }}-${{ hashFiles('**/CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json') }}
-          restore-keys: |
-            windows-ccache-${{ runner.arch }}-
-
-      # ============================================================
-      # 3. Visual Studio / MSVC / Windows SDK
-      # ============================================================
-
-      - name: Locate Visual Studio
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-
-          if (!(Test-Path $vswhere)) {
-            throw "vswhere.exe not found"
-          }
-
-          $vsPath = & $vswhere `
-            -latest `
-            -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
-
-          if (!$vsPath) {
-            throw "Visual Studio C++ build tools not found"
-          }
-
-          "VS_PATH=$vsPath" >> $env:GITHUB_ENV
-
-          Write-Host "Visual Studio:"
-          Write-Host $vsPath
-
-      - name: Setup Visual Studio environment
-        shell: pwsh
-        run: |
-          $vcvars = Join-Path $env:VS_PATH "VC\Auxiliary\Build\vcvars64.bat"
-
-          if (!(Test-Path $vcvars)) {
-            throw "vcvars64.bat not found: $vcvars"
-          }
-
-          cmd /c "`"$vcvars`" && set" > "$env:RUNNER_TEMP\vsenv.txt"
-
-          Get-Content "$env:RUNNER_TEMP\vsenv.txt" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              $name = $matches[1]
-              $value = $matches[2]
-
-              if ($name -notmatch '^(=)' -and $name -notmatch '^Path$') {
-                "$name=$value" >> $env:GITHUB_ENV
-              }
-            }
-          }
-
-          # PATH 单独处理
-          $pathLine = Get-Content "$env:RUNNER_TEMP\vsenv.txt" |
-            Where-Object { $_ -like "Path=*" } |
-            Select-Object -First 1
-
-          if ($pathLine) {
-            $vsPathValue = $pathLine.Substring(5)
-            "PATH=$vsPathValue;$env:PATH" >> $env:GITHUB_ENV
-          }
-
-      # ============================================================
-      # 4. Python
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 2. Python
+      # ------------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
 
-      - name: Verify Python
+      # ------------------------------------------------------------
+      # 3. MSVC
+      # ------------------------------------------------------------
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ------------------------------------------------------------
+      # 4. Rust 固定为 1.98.0
+      # 关键修复：不再使用最新 stable
+      # ------------------------------------------------------------
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Verify Rust
         shell: pwsh
         run: |
-          python --version
-          py --version
-
-      # ============================================================
-      # 5. Rust
-      # ============================================================
-
-      - name: Install Rust
-        shell: pwsh
-        run: |
-          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest `
-              -Uri "https://win.rustup.rs/x86_64" `
-              -OutFile "$env:RUNNER_TEMP\rustup-init.exe"
-
-            & "$env:RUNNER_TEMP\rustup-init.exe" `
-              -y `
-              --default-toolchain stable-x86_64-pc-windows-msvc
-
-            $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-          }
-
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
-          rustup default stable-x86_64-pc-windows-msvc
+          $ErrorActionPreference = "Stop"
 
           rustc --version
           cargo --version
 
-      # ============================================================
-      # 6. LLVM / Clang-CL
-      # ============================================================
-
-      - name: Locate clang-cl
-        shell: pwsh
-        run: |
-          $clang = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
-
-          if (!$clang) {
-            $candidates = @(
-              "${env:ProgramFiles}\LLVM\bin\clang-cl.exe",
-              "${env:ProgramFiles(x86)}\LLVM\bin\clang-cl.exe"
-            )
-
-            foreach ($candidate in $candidates) {
-              if (Test-Path $candidate) {
-                $clang = Get-Item $candidate
-                break
-              }
-            }
+          $version = rustc --version
+          if ($version -notmatch "1\.98\.0") {
+            throw "Expected Rust 1.98.0, got: $version"
           }
 
-          if (!$clang) {
-            throw "clang-cl.exe not found"
-          }
-
-          Write-Host "clang-cl:"
-          Write-Host $clang.Source
-
-          "CLANG_CL=$($clang.Source)" >> $env:GITHUB_ENV
-
-      - name: Verify Windows compiler
+      # ------------------------------------------------------------
+      # 5. 安装构建工具
+      # ------------------------------------------------------------
+      - name: Install build dependencies
         shell: pwsh
         run: |
-          where.exe clang-cl
+          $ErrorActionPreference = "Stop"
+
+          choco install llvm ninja nasm pkgconfiglite 7zip -y --no-progress
+
+          python -m pip install --upgrade pip cmake
+
+          $scripts = (python -c "import sysconfig; print(sysconfig.get_path('scripts'))").Trim()
+          $scripts | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$scripts;$env:PATH"
+
+          if (!(Get-Command clang-cl -ErrorAction SilentlyContinue)) {
+            throw "clang-cl not found"
+          }
+
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) {
+            throw "ninja not found"
+          }
+
+          if (!(Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            throw "pkg-config not found"
+          }
+
           clang-cl --version
-
-          Write-Host ""
-          Write-Host "Target:"
-          clang-cl --version | Select-String "Target"
-
-          where.exe cl
-          cl 2>&1 | Select-Object -First 3
-
-      # ============================================================
-      # 7. Ninja
-      # ============================================================
-
-      - name: Setup Ninja
-        shell: pwsh
-        run: |
-          $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
-
-          if (!$ninja) {
-            python -m pip install --upgrade ninja
-          }
-
           ninja --version
-
-      # ============================================================
-      # 8. CMake
-      # ============================================================
-
-      - name: Setup CMake
-        shell: pwsh
-        run: |
-          $cmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
-
-          if (!$cmake) {
-            throw "CMake is not available"
-          }
-
           cmake --version
-
-          $version = cmake --version |
-            Select-Object -First 1
-
-          Write-Host $version
-
-      # ============================================================
-      # 9. NASM
-      # ============================================================
-
-      - name: Verify NASM
-        shell: pwsh
-        run: |
-          if (!(Get-Command nasm.exe -ErrorAction SilentlyContinue)) {
-            choco install nasm -y --no-progress
-          }
-
+          pkg-config --version
           nasm -version
 
-      # ============================================================
-      # 10. pkg-config
-      # Official Windows Clang-CL prerequisite
-      # ============================================================
-
-      - name: Install pkg-config
+      # ------------------------------------------------------------
+      # 6. 缓存目录
+      # ------------------------------------------------------------
+      - name: Prepare cache directories
         shell: pwsh
         run: |
-          if (!(Get-Command pkg-config.exe -ErrorAction SilentlyContinue)) {
-            choco install pkgconfiglite -y --no-progress
-          }
+          $ErrorActionPreference = "Stop"
 
-          pkg-config --version
+          New-Item -ItemType Directory -Force ".cache\vcpkg" | Out-Null
+          New-Item -ItemType Directory -Force ".cache\ccache" | Out-Null
 
-      # ============================================================
-      # 11. Environment summary
-      # ============================================================
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: .cache\vcpkg
+          key: ladybird-vcpkg-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            ladybird-vcpkg-windows-
 
-      - name: Show build environment
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .cache\ccache
+          key: ladybird-ccache-windows-${{ hashFiles('**/CMakeLists.txt', 'vcpkg.json') }}
+          restore-keys: |
+            ladybird-ccache-windows-
+
+      - name: Configure cache environment
         shell: pwsh
         run: |
-          Write-Host "========================================"
-          Write-Host "BUILD ENVIRONMENT"
-          Write-Host "========================================"
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "OS:"
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version
+          $vcpkgCache = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg"
+          $ccache = Join-Path $env:GITHUB_WORKSPACE ".cache\ccache"
 
-          Write-Host ""
-          Write-Host "CPU:"
-          Get-CimInstance Win32_Processor |
-            Select-Object -First 1 Name, NumberOfCores, NumberOfLogicalProcessors
+          New-Item -ItemType Directory -Force $vcpkgCache | Out-Null
+          New-Item -ItemType Directory -Force $ccache | Out-Null
 
-          Write-Host ""
-          Write-Host "Memory:"
-          Get-CimInstance Win32_ComputerSystem |
-            Select-Object TotalPhysicalMemory
+          "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache" >> $env:GITHUB_ENV
+          "CCACHE_DIR=$ccache" >> $env:GITHUB_ENV
 
-          Write-Host ""
+          "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache"
+          "CCACHE_DIR=$ccache"
+
+      # ------------------------------------------------------------
+      # 7. 检查工具链
+      # ------------------------------------------------------------
+      - name: Verify build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Python:"
           python --version
 
-          Write-Host ""
+          Write-Host "Rust:"
+          rustc --version
+          cargo --version
+
           Write-Host "CMake:"
           cmake --version
 
-          Write-Host ""
           Write-Host "Ninja:"
           ninja --version
 
-          Write-Host ""
-          Write-Host "Clang:"
+          Write-Host "Clang-CL:"
           clang-cl --version
 
-          Write-Host ""
-          Write-Host "Rust:"
-          rustc --version
+          Write-Host "MSVC:"
+          cl.exe
 
-      # ============================================================
-      # 12. Configure vcpkg cache
-      # ============================================================
+          Write-Host "pkg-config:"
+          pkg-config --version
 
-      - name: Configure vcpkg cache
+      # ------------------------------------------------------------
+      # 8. 清理旧构建输出
+      # ------------------------------------------------------------
+      - name: Prepare build directory
         shell: pwsh
         run: |
-          $cache = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg"
+          $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Force $cache | Out-Null
+          Remove-Item "Build\release" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "Ladybird-Windows-x64.zip" -Force -ErrorAction SilentlyContinue
 
-          if (!(Test-Path $cache -PathType Container)) {
-            throw "vcpkg binary cache is not a directory"
-          }
+          New-Item -ItemType Directory -Force "dist" | Out-Null
 
-          $env:VCPKG_DEFAULT_BINARY_CACHE = $cache
-
-          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
-
-          Write-Host "VCPKG_DEFAULT_BINARY_CACHE=$cache"
-
-      # ============================================================
-      # 13. ccache
-      # ============================================================
-
-      - name: Configure compiler cache
-        shell: pwsh
-        run: |
-          $ccache = Join-Path $env:GITHUB_WORKSPACE ".cache\ccache"
-
-          New-Item -ItemType Directory -Force $ccache | Out-Null
-
-          "CCACHE_DIR=$ccache" >> $env:GITHUB_ENV
-
-      # ============================================================
-      # 14. Build Ladybird
-      #
-      # Official Windows native experimental route:
-      # py Meta\ladybird.py build
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 9. 编译 Ladybird
+      # ------------------------------------------------------------
       - name: Build Ladybird
         shell: pwsh
         env:
-          BUILD_PRESET: ${{ inputs.build_type }}
           CC: clang-cl
           CXX: clang-cl
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.cache\vcpkg
+          CCACHE_DIR: ${{ github.workspace }}\.cache\ccache
+          VCPKG_MAX_CONCURRENCY: "4"
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "========================================"
-          Write-Host "BUILDING LADYBIRD"
-          Write-Host "========================================"
+          Write-Host "======================================"
+          Write-Host "Starting Ladybird Windows x64 build"
+          Write-Host "======================================"
 
-          Write-Host "Ref: ${{ inputs.ref }}"
-          Write-Host "Build type: ${{ inputs.build_type }}"
+          Write-Host "Rust:"
+          rustc --version
 
-          if (!(Test-Path "Meta\ladybird.py")) {
-            throw "Meta\ladybird.py not found"
-          }
+          Write-Host "Compiler:"
+          clang-cl --version
 
-          # Ensure cargo is available
-          $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-
-          # Use official Ladybird build entry point
           py Meta\ladybird.py build
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Ladybird build failed with exit code $LASTEXITCODE"
+            throw "Ladybird build failed: $LASTEXITCODE"
           }
 
-      # ============================================================
-      # 15. Locate executable
-      # ============================================================
+          Write-Host "Build completed."
 
-      - name: Locate Ladybird executable
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $candidates = @(
-            "Build\release\bin\Ladybird.exe",
-            "Build\RelWithDebInfo\bin\Ladybird.exe",
-            "Build\release\bin\ladybird.exe",
-            "Build\RelWithDebInfo\bin\ladybird.exe"
-          )
-
-          $exe = $null
-
-          foreach ($candidate in $candidates) {
-            if (Test-Path $candidate) {
-              $exe = Resolve-Path $candidate
-              break
-            }
-          }
-
-          if (!$exe) {
-            Write-Host "Searching entire Build directory..."
-
-            $exe = Get-ChildItem `
-              -Path "Build" `
-              -Filter "Ladybird.exe" `
-              -Recurse `
-              -File `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-          }
-
-          if (!$exe) {
-            throw "Ladybird.exe was not found"
-          }
-
-          Write-Host "Ladybird executable:"
-          Write-Host $exe.FullName
-
-          "LADYBIRD_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
-
-      # ============================================================
-      # 16. Verify PE x64
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 10. 检查 EXE
+      # ------------------------------------------------------------
       - name: Verify Windows executable
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $exe = Get-Item "$env:LADYBIRD_EXE"
+          $exe = Get-ChildItem "Build" -Recurse -File -Filter "Ladybird.exe" |
+            Select-Object -First 1
 
-          Write-Host "File:"
-          Write-Host $exe.FullName
-
-          Write-Host ""
-          Write-Host "Size:"
-          Write-Host "$([math]::Round($exe.Length / 1MB, 2)) MB"
+          if (!$exe) {
+            throw "Ladybird.exe was not found"
+          }
 
           $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
 
@@ -487,9 +265,8 @@ jobs:
             throw "Invalid executable"
           }
 
-          # DOS MZ
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            throw "Ladybird.exe is not a valid Windows PE executable"
+            throw "Not a Windows PE executable"
           }
 
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
@@ -497,209 +274,143 @@ jobs:
           if (
             $bytes[$peOffset] -ne 0x50 -or
             $bytes[$peOffset + 1] -ne 0x45 -or
-            $bytes[$peOffset + 2] -ne 0x00 -or
-            $bytes[$peOffset + 3] -ne 0x00
+            $bytes[$peOffset + 2] -ne 0 -or
+            $bytes[$peOffset + 3] -ne 0
           ) {
             throw "Invalid PE signature"
           }
 
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
 
-          Write-Host "PE machine: 0x$('{0:X4}' -f $machine)"
-
-          # AMD64 = 0x8664
           if ($machine -ne 0x8664) {
-            throw "Executable is not Windows x64. Machine = 0x$('{0:X4}' -f $machine)"
+            throw "Not an AMD64 executable. Machine: $machine"
           }
 
-          Write-Host ""
-          Write-Host "VALID WINDOWS x64 PE"
-          Write-Host "Architecture: AMD64"
+          "LADYBIRD_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
 
-      # ============================================================
-      # 17. Prepare clean distribution directory
-      # ============================================================
+          Write-Host "Valid Windows x64 executable:"
+          Write-Host $exe.FullName
 
-      - name: Prepare Windows distribution
+      # ------------------------------------------------------------
+      # 11. 使用 CMake 安装规则生成运行目录
+      # ------------------------------------------------------------
+      - name: Install Ladybird runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Remove-Item -Recurse -Force "dist" -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force "dist\Ladybird" | Out-Null
+          $build = Join-Path $env:GITHUB_WORKSPACE "Build\release"
+          $prefix = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
 
-          $exe = Get-Item "$env:LADYBIRD_EXE"
-
-          # Find the actual bin directory
-          $bin = $exe.Directory.FullName
-
-          Write-Host "Binary directory:"
-          Write-Host $bin
-
-          # Copy Ladybird executable
-          Copy-Item $exe.FullName "dist\Ladybird\Ladybird.exe"
-
-          # Copy DLLs and runtime files that belong to the executable
-          Get-ChildItem $bin -File |
-            Where-Object {
-              $_.Extension -in @(
-                ".dll",
-                ".pdb"
-              )
-            } |
-            Copy-Item -Destination "dist\Ladybird" -Force
-
-          # Resource directories
-          $resourceCandidates = @(
-            (Join-Path $bin "res"),
-            (Join-Path $bin "Resources"),
-            (Join-Path $bin "share"),
-            (Join-Path $bin "pdfjs")
-          )
-
-          foreach ($resource in $resourceCandidates) {
-            if (Test-Path $resource) {
-              Copy-Item `
-                $resource `
-                "dist\Ladybird" `
-                -Recurse `
-                -Force
-            }
+          if (!(Test-Path $build)) {
+            throw "Build\release directory not found"
           }
 
-          # Copy resource tree if present in source
-          if (Test-Path "Base\res") {
-            New-Item -ItemType Directory -Force "dist\Ladybird\res" | Out-Null
+          New-Item -ItemType Directory -Force $prefix | Out-Null
 
-            Copy-Item `
-              "Base\res\*" `
-              "dist\Ladybird\res" `
-              -Recurse `
-              -Force
+          cmake --install $build --prefix $prefix
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake install failed: $LASTEXITCODE"
           }
 
-          Write-Host ""
-          Write-Host "Distribution contents:"
-          Get-ChildItem "dist\Ladybird" -Recurse |
+      # ------------------------------------------------------------
+      # 12. 检查安装目录
+      # ------------------------------------------------------------
+      - name: Verify install tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $prefix = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
+
+          $exe = Get-ChildItem $prefix -Recurse -File -Filter "Ladybird.exe" |
+            Select-Object -First 1
+
+          if (!$exe) {
+            Write-Host "Install directory contents:"
+            Get-ChildItem $prefix -Recurse | Select-Object FullName
+            throw "Ladybird.exe missing from install tree"
+          }
+
+          Write-Host "Installed executable:"
+          Write-Host $exe.FullName
+
+      # ------------------------------------------------------------
+      # 13. 只清理调试符号和中间文件
+      # 不删除 DLL、Qt 插件和资源
+      # ------------------------------------------------------------
+      - name: Remove development files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
+
+          foreach ($pattern in @("*.pdb", "*.ilk", "*.obj", "*.exp", "*.lib")) {
+            Get-ChildItem $root -Recurse -File -Filter $pattern |
+              Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Runtime DLL count:"
+          (Get-ChildItem $root -Recurse -File -Filter "*.dll").Count
+
+          Write-Host "EXE files:"
+          Get-ChildItem $root -Recurse -File -Filter "*.exe" |
             Select-Object FullName, Length
 
-      # ============================================================
-      # 18. Check dependent DLLs
-      # ============================================================
-
-      - name: Check runtime DLLs
+      # ------------------------------------------------------------
+      # 14. 检查打包内容
+      # ------------------------------------------------------------
+      - name: Inspect package contents
         shell: pwsh
         run: |
-          $exe = Resolve-Path "dist\Ladybird\Ladybird.exe"
+          $root = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
 
-          Write-Host "Checking executable dependencies..."
+          $files = Get-ChildItem $root -Recurse -File
+          $total = ($files | Measure-Object Length -Sum).Sum
 
-          if (Get-Command dumpbin.exe -ErrorAction SilentlyContinue) {
-            dumpbin /DEPENDENTS "$exe"
-          }
-          else {
-            Write-Host "dumpbin.exe not available; skipping dependency listing"
-          }
+          Write-Host "File count: $($files.Count)"
+          Write-Host "Total size: $([math]::Round($total / 1MB, 2)) MB"
 
-      # ============================================================
-      # 19. Test executable startup
-      # ============================================================
+          Write-Host "Largest files:"
+          $files |
+            Sort-Object Length -Descending |
+            Select-Object -First 30 FullName,
+              @{Name="MB";Expression={[math]::Round($_.Length / 1MB, 2)}} |
+            Format-Table -AutoSize
 
-      - name: Smoke test Ladybird
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $exe = Resolve-Path "dist\Ladybird\Ladybird.exe"
-
-          Write-Host "Starting Ladybird for smoke test..."
-
-          $process = Start-Process `
-            -FilePath $exe `
-            -ArgumentList "--version" `
-            -PassThru `
-            -Wait `
-            -NoNewWindow `
-            -ErrorAction SilentlyContinue
-
-          if ($process) {
-            Write-Host "Exit code: $($process.ExitCode)"
-          }
-
-          # Do not fail solely because --version is unsupported.
-          # PE validation above is mandatory.
-
-      # ============================================================
-      # 20. Remove unnecessary files
-      # ============================================================
-
-      - name: Minimize package
+      # ------------------------------------------------------------
+      # 15. 生成 ZIP
+      # ------------------------------------------------------------
+      - name: Create Windows ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Remove build/debug leftovers
-          Get-ChildItem "dist\Ladybird" -Recurse -Force |
-            Where-Object {
-              $_.Name -match '\.(obj|ilk|exp|lib)$'
-            } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
+          $root = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
+          $zip = Join-Path $env:GITHUB_WORKSPACE "Ladybird-Windows-x64.zip"
 
-          # PDB is useful for debugging but not required for normal release.
-          # Remove PDB to reduce package size.
-          Get-ChildItem "dist\Ladybird" -Recurse -Filter "*.pdb" |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-
-          Write-Host "Final package files:"
-          Get-ChildItem "dist\Ladybird" -Recurse -File |
-            Select-Object FullName,
-              @{Name="MB";Expression={[math]::Round($_.Length / 1MB, 2)}}
-
-          $total = (
-            Get-ChildItem "dist\Ladybird" -Recurse -File |
-            Measure-Object Length -Sum
-          ).Sum
-
-          Write-Host ""
-          Write-Host "Total package size:"
-          Write-Host "$([math]::Round($total / 1MB, 2)) MB"
-
-      # ============================================================
-      # 21. Create Windows x64 ZIP
-      # ============================================================
-
-      - name: Create Windows x64 ZIP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Remove-Item `
-            "Ladybird-Windows-x64.zip" `
-            -Force `
-            -ErrorAction SilentlyContinue
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           Compress-Archive `
-            -Path "dist\Ladybird\*" `
-            -DestinationPath "Ladybird-Windows-x64.zip" `
+            -Path "$root\*" `
+            -DestinationPath $zip `
             -CompressionLevel Optimal
 
-          $zip = Get-Item "Ladybird-Windows-x64.zip"
+          if (!(Test-Path $zip)) {
+            throw "ZIP creation failed"
+          }
 
-          Write-Host "========================================"
-          Write-Host "PACKAGE CREATED"
-          Write-Host "========================================"
+          $info = Get-Item $zip
+          Write-Host "ZIP size: $([math]::Round($info.Length / 1MB, 2)) MB"
 
-          Write-Host "File:"
-          Write-Host $zip.FullName
-
-          Write-Host "Size:"
-          Write-Host "$([math]::Round($zip.Length / 1MB, 2)) MB"
-
-      # ============================================================
-      # 22. Upload Actions artifact
-      # ============================================================
-
-      - name: Upload Windows ZIP artifact
+      # ------------------------------------------------------------
+      # 16. 上传 Artifact
+      # ------------------------------------------------------------
+      - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
           name: Ladybird-Windows-x64
@@ -708,32 +419,34 @@ jobs:
           compression-level: 0
           retention-days: 30
 
-      # ============================================================
-      # 23. Create GitHub Release
-      # ============================================================
-
+      # ------------------------------------------------------------
+      # 17. 发布 GitHub Pre-release
+      # ------------------------------------------------------------
       - name: Generate release tag
         if: ${{ inputs.publish_release }}
         shell: pwsh
         run: |
-          $date = Get-Date -Format "yyyyMMdd-HHmm"
-
-          $tag = "v$date-${{ github.run_number }}"
-
+          $date = Get-Date -Format "yyyyMMdd-HHmmss"
+          $tag = "windows-$date-${{ github.run_number }}"
           "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
 
-          Write-Host "Release tag:"
-          Write-Host $tag
-
-      - name: Publish GitHub Release
+      - name: Publish GitHub Pre-release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: "Ladybird Windows x64 ${{ env.RELEASE_TAG }}"
-          draft: false
           prerelease: true
-          generate_release_notes: true
+          draft: false
+          generate_release_notes: false
+          body: |
+            Unofficial Ladybird Windows x64 build.
+
+            Source ref: ${{ inputs.ref }}
+
+            Rust toolchain: 1.98.0
+            Compiler: Clang-CL + MSVC
+            Build system: CMake + Ninja
           files: |
             Ladybird-Windows-x64.zip
         env:
