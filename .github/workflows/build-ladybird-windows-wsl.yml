@@ -1,22 +1,21 @@
-name: Build Ladybird Windows x64
+
+name: Ladybird Windows x64 Build
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird upstream branch, tag, or commit"
+        description: "Ladybird source branch, tag, or commit"
         required: true
         default: "master"
         type: string
-
       publish_release:
-        description: "Publish GitHub prerelease"
+        description: "Publish GitHub Pre-release"
         required: true
         default: false
         type: boolean
-
       clean_build:
-        description: "Clean build directory"
+        description: "Clean previous build directories"
         required: true
         default: true
         type: boolean
@@ -30,819 +29,387 @@ concurrency:
 
 jobs:
   build:
-    name: Build Ladybird Windows x64
+    name: Ladybird Windows x64
     runs-on: windows-2025
     timeout-minutes: 360
 
     env:
-      VCPKG_MAX_CONCURRENCY: "4"
-      CMAKE_BUILD_PARALLEL_LEVEL: "4"
-      CARGO_BUILD_JOBS: "4"
-      VCPKG_DISABLE_METRICS: "1"
+      VCPKG_MAX_CONCURRENCY: 4
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CARGO_BUILD_JOBS: 4
+      VCPKG_DISABLE_METRICS: 1
+      PYTHONUTF8: 1
+      BUILD_DIR: Build/release
+      PACKAGE_DIR: dist/Ladybird
+      PACKAGE_NAME: Ladybird-Windows-x64
 
     steps:
-      # ================================================
+      # --------------------------------------------------
       # 1. Checkout
-      # ================================================
+      # --------------------------------------------------
 
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
           repository: LadybirdBrowser/ladybird
-          ref: ${{ inputs.ref }}
-          fetch-depth: 1
+          ref: ${{ inputs.ref || 'master' }}
           submodules: recursive
+          fetch-depth: 0
 
-      - name: Record upstream revision
+      - name: Record source revision
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force diagnostics | Out-Null
 
-          $sha = git rev-parse HEAD
-          $short = $sha.Substring(0, 12)
+          git rev-parse HEAD |
+            Out-File diagnostics/source-revision.txt
 
-          "UPSTREAM_SHA=$sha" >> $env:GITHUB_ENV
-          "UPSTREAM_SHORT=$short" >> $env:GITHUB_ENV
+          git status --short |
+            Out-File diagnostics/source-status.txt
 
-          Write-Host "Upstream revision: $sha"
+      # --------------------------------------------------
+      # 2. Build environment
+      # --------------------------------------------------
 
-      # ================================================
-      # 2. Python
-      # ================================================
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      # ================================================
-      # 3. MSVC
-      # ================================================
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup MSVC x64
+      - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ================================================
-      # 4. Rust
-      # ================================================
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      # ================================================
-      # 5. Install tools
-      # ================================================
-
-      - name: Install LLVM and Ninja
+      - name: Install build tools
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           choco install llvm ninja nasm pkgconfiglite 7zip -y --no-progress
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Chocolatey installation failed"
+          $paths = @(
+            "C:\Program Files\LLVM\bin",
+            "C:\Program Files\Ninja",
+            "C:\Program Files\7-Zip"
+          )
+
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Add-Content $env:GITHUB_PATH $path
+            }
           }
 
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
           python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) {
-            throw "pip upgrade failed"
-          }
-
           python -m pip install cmake
-          if ($LASTEXITCODE -ne 0) {
-            throw "CMake installation failed"
-          }
 
-          $llvm = "C:\Program Files\LLVM\bin"
-          $choco = "C:\ProgramData\chocolatey\bin"
-
-          if (Test-Path "$llvm\clang-cl.exe") {
-            $llvm | Out-File $env:GITHUB_PATH -Append
-          }
-
-          if (Test-Path "$choco\ninja.exe") {
-            $choco | Out-File $env:GITHUB_PATH -Append
-          }
-
-          Write-Host "=== Tool versions ==="
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
           clang-cl --version
-          ninja --version
+          clang --version
           cmake --version
-          nasm -v
+          ninja --version
           python --version
           rustc --version
           cargo --version
 
-      # ================================================
-      # 6. Verify environment
-      # ================================================
+      # --------------------------------------------------
+      # 3. Cache
+      # --------------------------------------------------
 
-      - name: Verify build environment
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $tools = @(
-            "clang-cl.exe",
-            "ninja.exe",
-            "cmake.exe",
-            "nasm.exe",
-            "python.exe",
-            "cargo.exe"
-          )
-
-          foreach ($tool in $tools) {
-            $found = Get-Command $tool -ErrorAction SilentlyContinue
-
-            if (!$found) {
-              throw "Required tool missing: $tool"
-            }
-
-            Write-Host "$tool : $($found.Source)"
-          }
-
-          Write-Host "=== MSVC environment ==="
-          Write-Host "VCINSTALLDIR=$env:VCINSTALLDIR"
-          Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
-
-          if (!$env:VCINSTALLDIR) {
-            throw "MSVC environment is not initialized"
-          }
-
-          cl.exe 2>&1 | Select-Object -First 3
-
-      # ================================================
-      # 7. Cache vcpkg binary packages
-      # ================================================
-
-      - name: Restore vcpkg binary cache
+      - name: Cache vcpkg
         uses: actions/cache@v4
         with:
-          path: .cache/vcpkg
-          key: ladybird-vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          path: |
+            .cache/vcpkg
+            Build/vcpkg
+            Build/vcpkg-release
+            Build/release/vcpkg_installed
+          key: ladybird-vcpkg-${{ runner.os }}-${{ hashFiles('Meta/CMake/vcpkg.json', 'Meta/CMake/vcpkg-configuration.json') }}
           restore-keys: |
-            ladybird-vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
-            ladybird-vcpkg-windows-x64-
+            ladybird-vcpkg-${{ runner.os }}-
 
-      - name: Configure vcpkg binary cache
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $cache = Join-Path $pwd ".cache/vcpkg"
-
-          New-Item -ItemType Directory -Force $cache | Out-Null
-
-          "VCPKG_DEFAULT_BINARY_CACHE=$cache" |
-            Out-File $env:GITHUB_ENV -Append
-
-          Write-Host "Binary cache: $cache"
-
-      # ================================================
-      # 8. Clean build
-      # ================================================
+      # --------------------------------------------------
+      # 4. Clean build
+      # --------------------------------------------------
 
       - name: Clean previous build
-        if: inputs.clean_build
+        if: ${{ inputs.clean_build == true }}
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $paths = @(
+            "Build/release",
+            "Build/vcpkg-release",
+            "dist/Ladybird"
+          )
 
-          Remove-Item "Build/release" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "Build/vcpkg-release" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
+          }
 
-          Write-Host "Build directories cleaned."
+      # --------------------------------------------------
+      # 5. Inspect CPU baseline source
+      # --------------------------------------------------
 
-      # ================================================
-      # 9. Bootstrap Ladybird vcpkg
-      # ================================================
-
-      - name: Bootstrap Ladybird vcpkg
+      - name: Inspect CPU baseline implementation
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $files = @(
+            "Meta/CMake/cmake_options.cmake",
+            "Meta/CMake/compile_options.cmake",
+            "Meta/CMake/rust_crate.cmake"
+          )
 
-          Write-Host "Bootstrapping Ladybird's pinned vcpkg..."
+          foreach ($file in $files) {
+            if (Test-Path $file) {
+              "===== $file =====" |
+                Out-File diagnostics/cpu-baseline-source.txt -Append
 
-          py Meta/ladybird.py vcpkg --preset Release
+              Select-String -Path $file `
+                -Pattern "LADYBIRD_BASELINE_CPU_TARGET|ENABLE_CI_BASELINE_CPU|x86-64-v2|target-cpu|march|/arch" `
+                -Context 4,8 |
+                Out-File diagnostics/cpu-baseline-source.txt -Append
+            }
+          }
+
+          $found = Select-String `
+            -Path "Meta/CMake/*.cmake" `
+            -Pattern "LADYBIRD_BASELINE_CPU_TARGET" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $found) {
+            throw "Could not find LADYBIRD_BASELINE_CPU_TARGET in Meta/CMake."
+          }
+
+          Write-Host "Ladybird CPU baseline option found in source."
+
+      # --------------------------------------------------
+      # 6. Install vcpkg dependencies
+      # --------------------------------------------------
+
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          python Meta/ladybird.py vcpkg --preset Release
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Ladybird vcpkg bootstrap failed"
+            throw "vcpkg dependency installation failed."
           }
 
-          $vcpkgRoot = Join-Path $pwd "Build/vcpkg-release"
-          $vcpkgExe = Join-Path $vcpkgRoot "vcpkg.exe"
-          $nghttp2Port = Join-Path $vcpkgRoot "ports/nghttp2/portfile.cmake"
-
-          Write-Host "vcpkg root: $vcpkgRoot"
-
-          if (!(Test-Path $vcpkgExe)) {
-            Write-Host "=== Build/vcpkg directory listing ==="
-            Get-ChildItem Build -Force
-            throw "Ladybird vcpkg executable not found: $vcpkgExe"
-          }
-
-          if (!(Test-Path $nghttp2Port)) {
-            Write-Host "=== Searching for nghttp2 base port ==="
-
-            Get-ChildItem Build -Filter portfile.cmake -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match 'nghttp2' } |
-              Select-Object -ExpandProperty FullName
-
-            throw "nghttp2 base port missing from Ladybird vcpkg root"
-          }
-
-          "VCPKG_ROOT=$vcpkgRoot" |
-            Out-File $env:GITHUB_ENV -Append
-
-          "VCPKG_EXECUTABLE=$vcpkgExe" |
-            Out-File $env:GITHUB_ENV -Append
-
-          Write-Host "Ladybird vcpkg bootstrap verified."
-          Write-Host "nghttp2 base port found."
-
-      # ================================================
-      # 10. Verify vcpkg overlay
-      # ================================================
-
-      - name: Verify nghttp2 overlay and vcpkg paths
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $overlay = "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake"
-          $basePort = Join-Path $env:VCPKG_ROOT "ports/nghttp2/portfile.cmake"
-
-          if (!(Test-Path $overlay)) {
-            throw "Ladybird nghttp2 overlay not found"
-          }
-
-          if (!(Test-Path $basePort)) {
-            throw "nghttp2 base port not found: $basePort"
-          }
-
-          Write-Host "=== Overlay portfile ==="
-          Get-Content $overlay
-
-          Write-Host "=== Base portfile ==="
-          Write-Host $basePort
-
-          Write-Host "=== vcpkg environment ==="
-          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-          Write-Host "VCPKG_EXECUTABLE=$env:VCPKG_EXECUTABLE"
-
-          if ($env:VCPKG_ROOT -match "Program Files\\Microsoft Visual Studio") {
-            throw "VCPKG_ROOT incorrectly points to Visual Studio"
-          }
-
-      # ================================================
-      # 11. Inspect upstream build script
-      # ================================================
-
-      - name: Inspect Ladybird build script
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (!(Test-Path "Meta/ladybird.py")) {
-            throw "Meta/ladybird.py not found"
-          }
-
-          Select-String `
-            -Path "Meta/ladybird.py" `
-            -Pattern "cmake|preset|Build/release|vcpkg" `
-            -Context 2,2
-
-      # ================================================
-      # 12. Configure CMake
-      # ================================================
+      # --------------------------------------------------
+      # 7. Configure
+      # --------------------------------------------------
 
       - name: Configure Release
         shell: pwsh
-        env:
-          CC: clang-cl
-          CXX: clang-cl
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-
-          if (!(Test-Path $env:VCPKG_EXECUTABLE)) {
-            throw "vcpkg executable is missing"
-          }
-
-          $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source
-
-          Write-Host "Ninja: $ninja"
-
           cmake --preset Release `
-            "-DCMAKE_MAKE_PROGRAM=$ninja" `
-            -DENABLE_CI_BASELINE_CPU=ON
+            -DCMAKE_MAKE_PROGRAM="$(Get-Command ninja).Source" `
+            -DLADYBIRD_BASELINE_CPU_TARGET=ON `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
           if ($LASTEXITCODE -ne 0) {
-            throw "CMake configuration failed"
+            throw "CMake configuration failed."
           }
 
-          $cacheFile = "Build/release/CMakeCache.txt"
+      # --------------------------------------------------
+      # 8. Verify actual CMake option
+      # --------------------------------------------------
 
-          if (!(Test-Path $cacheFile)) {
-            throw "CMakeCache.txt missing"
+      - name: Verify CPU baseline option
+        shell: pwsh
+        run: |
+          $cache = "Build/release/CMakeCache.txt"
+
+          if (-not (Test-Path $cache)) {
+            throw "CMakeCache.txt not found."
           }
 
-          $cache = Get-Content $cacheFile -Raw
+          Copy-Item $cache diagnostics/CMakeCache.txt -Force
 
-          if ($cache -notmatch 'ENABLE_CI_BASELINE_CPU:BOOL=ON') {
-            throw "Portable CPU baseline is not enabled"
+          $content = Get-Content $cache -Raw
+
+          $enabled = [regex]::IsMatch(
+            $content,
+            '(?m)^LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON$'
+          )
+
+          if (-not $enabled) {
+            Select-String -Path $cache `
+              -Pattern "BASELINE_CPU|CMAKE_CXX_COMPILER|CMAKE_C_COMPILER" |
+              Out-File diagnostics/cpu-baseline-cache.txt
+
+            throw "LADYBIRD_BASELINE_CPU_TARGET is not ON."
           }
 
-          Write-Host "CMake configuration passed."
+          "LADYBIRD_BASELINE_CPU_TARGET=ON" |
+            Tee-Object diagnostics/cpu-baseline-status.txt
 
-      # ================================================
-      # 13. Build Ladybird
-      # ================================================
+          Select-String -Path $cache `
+            -Pattern "BASELINE_CPU|CMAKE_CXX_COMPILER|CMAKE_C_COMPILER" |
+            Out-File diagnostics/cpu-baseline-cache.txt
+
+      # --------------------------------------------------
+      # 9. Inspect compiler commands
+      # --------------------------------------------------
+
+      - name: Inspect compiler CPU flags
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $commands = "Build/release/compile_commands.json"
+
+          if (Test-Path $commands) {
+            Select-String -Path $commands `
+              -Pattern "march=|target-cpu=|/arch:|x86-64-v2|avx2|avx512" |
+              Out-File diagnostics/compiler-cpu-flags.txt
+
+            if ((Get-Item diagnostics/compiler-cpu-flags.txt).Length -eq 0) {
+              "No matching CPU flags found in compile_commands.json." |
+                Out-File diagnostics/compiler-cpu-flags.txt
+            }
+          } else {
+            "compile_commands.json not found." |
+              Out-File diagnostics/compiler-cpu-flags.txt
+          }
+
+      # --------------------------------------------------
+      # 10. Build
+      # --------------------------------------------------
 
       - name: Build Ladybird
         shell: pwsh
-        env:
-          CC: clang-cl
-          CXX: clang-cl
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Building Ladybird..."
-
-          py Meta/ladybird.py build
+          cmake --build Build/release --parallel 4
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Ladybird build failed"
+            throw "Ladybird build failed."
           }
 
-          Write-Host "Ladybird build completed."
-
-      # ================================================
-      # 14. Verify CPU baseline
-      # ================================================
-
-      - name: Verify CPU baseline
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $cacheFile = "Build/release/CMakeCache.txt"
-
-          if (!(Test-Path $cacheFile)) {
-            throw "CMakeCache.txt missing"
-          }
-
-          $cache = Get-Content $cacheFile -Raw
-
-          if ($cache -notmatch 'ENABLE_CI_BASELINE_CPU:BOOL=ON') {
-            throw "CPU baseline was disabled during build"
-          }
-
-          Write-Host "CPU baseline cache verification passed."
-
-          $commandsFile = "Build/release/compile_commands.json"
-
-          if (Test-Path $commandsFile) {
-            $commands = Get-Content $commandsFile -Raw
-
-            $badFlags = @(
-              "-march=native",
-              "-mavx2",
-              "-mavx512",
-              "/arch:AVX2",
-              "/arch:AVX512"
-            )
-
-            foreach ($flag in $badFlags) {
-              if ($commands.Contains($flag)) {
-                throw "Non-portable compiler flag detected: $flag"
-              }
-            }
-
-            Write-Host "Compiler flag scan passed."
-          }
-          else {
-            Write-Warning "compile_commands.json unavailable."
-          }
-
-      # ================================================
-      # 15. Install
-      # ================================================
+      # --------------------------------------------------
+      # 11. Install
+      # --------------------------------------------------
 
       - name: Install Ladybird
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force dist | Out-Null
 
-          New-Item -ItemType Directory -Force "dist" | Out-Null
-
-          cmake --install Build/release --prefix "$pwd/dist/Ladybird"
+          cmake --install Build/release --prefix dist/Ladybird
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Installation failed"
+            throw "Ladybird installation failed."
           }
 
-          if (!(Test-Path "dist/Ladybird")) {
-            throw "Install directory missing"
+          if (-not (Test-Path "dist/Ladybird")) {
+            throw "Install directory was not created."
           }
 
-      # ================================================
-      # 16. Bundle runtime dependencies
-      # ================================================
+          Get-ChildItem dist/Ladybird -Recurse -File |
+            Select-Object FullName, Length |
+            Export-Csv diagnostics/install-files.csv -NoTypeInformation
 
-      - name: Bundle runtime dependencies
+      # --------------------------------------------------
+      # 12. Package portable ZIP
+      # --------------------------------------------------
+
+      - name: Package Windows ZIP
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
 
-          $root = Join-Path $pwd "dist/Ladybird"
-          $bin = Join-Path $root "bin"
+          if (-not (Test-Path $sevenZip)) {
+            $command = Get-Command 7z -ErrorAction SilentlyContinue
 
-          New-Item -ItemType Directory -Force $bin | Out-Null
-
-          Write-Host "Searching for runtime DLLs..."
-
-          # Copy DLLs produced or staged in the release build.
-          $dlls = Get-ChildItem `
-            -Path "Build/release" `
-            -Filter "*.dll" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue
-
-          foreach ($dll in $dlls) {
-            Copy-Item $dll.FullName $bin -Force
-          }
-
-          # Copy vcpkg installed triplet DLLs if present.
-          $tripletBin = Join-Path `
-            $pwd `
-            "Build/release/vcpkg_installed/vcpkg/installed/x64-windows/bin"
-
-          if (Test-Path $tripletBin) {
-            Get-ChildItem $tripletBin -Filter "*.dll" -File |
-              Copy-Item -Destination $bin -Force
-          }
-
-          # Find Qt runtime directory.
-          $qtCore = Get-ChildItem `
-            -Path "Build/release" `
-            -Filter "Qt6Core.dll" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if ($qtCore) {
-            $qtBin = $qtCore.Directory.FullName
-
-            Get-ChildItem $qtBin -Filter "*.dll" -File |
-              Copy-Item -Destination $bin -Force
-
-            $plugins = Join-Path $qtBin "..\plugins"
-
-            if (Test-Path $plugins) {
-              Copy-Item $plugins "$root\plugins" -Recurse -Force
-            }
-          }
-          else {
-            Write-Warning "Qt6Core.dll not found in build tree."
-          }
-
-          # Copy helper executables from bin/libexec directories.
-          Get-ChildItem "Build/release" -Filter "*.exe" -File -Recurse |
-            Where-Object {
-              $_.FullName -match '[/\\](bin|libexec)[/\\]'
-            } |
-            ForEach-Object {
-              if ($_.Name -ne "Ladybird.exe") {
-                Copy-Item $_.FullName $bin -Force
-              }
+            if (-not $command) {
+              throw "7-Zip executable not found."
             }
 
-          Write-Host "Runtime DLL count: $((Get-ChildItem $bin -Filter '*.dll' -File).Count)"
-
-      # ================================================
-      # 17. Validate package
-      # ================================================
-
-      - name: Validate package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $root = Join-Path $pwd "dist/Ladybird"
-
-          $exe = Get-ChildItem $root -Filter "Ladybird.exe" -File -Recurse |
-            Select-Object -First 1
-
-          if (!$exe) {
-            throw "Ladybird.exe not found"
+            $sevenZip = $command.Source
           }
 
-          Write-Host "Executable: $($exe.FullName)"
-
-          $dllCount = (
-            Get-ChildItem $root -Filter "*.dll" -File -Recurse
-          ).Count
-
-          Write-Host "Bundled DLL count: $dllCount"
-
-          if ($dllCount -eq 0) {
-            Write-Warning "No DLLs were found in the package."
-          }
-
-      # ================================================
-      # 18. Remove development files
-      # ================================================
-
-      - name: Remove development files
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $root = Join-Path $pwd "dist/Ladybird"
-
-          Get-ChildItem $root -Recurse -File |
-            Where-Object {
-              $_.Extension -in @(
-                ".pdb",
-                ".ilk",
-                ".obj",
-                ".exp",
-                ".lib"
-              )
-            } |
-            Remove-Item -Force
-
-      # ================================================
-      # 19. Create portable ZIP
-      # ================================================
-
-      - name: Create portable ZIP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $zip = "Ladybird-Windows-x64-x86-64-v2.zip"
+          $zip = "dist/$env:PACKAGE_NAME.zip"
 
           if (Test-Path $zip) {
             Remove-Item $zip -Force
           }
 
-          Compress-Archive `
-            -Path "dist/Ladybird/*" `
-            -DestinationPath $zip `
-            -CompressionLevel Optimal
-
-          if (!(Test-Path $zip)) {
-            throw "ZIP creation failed"
-          }
-
-          "PACKAGE_ZIP=$zip" >> $env:GITHUB_ENV
-
-          $size = (Get-Item $zip).Length / 1MB
-
-          Write-Host ("Package size: {0:N2} MB" -f $size)
-
-      # ================================================
-      # 20. Verify ZIP
-      # ================================================
-
-      - name: Verify ZIP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          tar -tf $env:PACKAGE_ZIP | Out-File zip-list.txt
+          & $sevenZip a -tzip $zip ".\dist\Ladybird\*" -mx=5
 
           if ($LASTEXITCODE -ne 0) {
-            throw "ZIP integrity check failed"
+            throw "ZIP packaging failed."
           }
 
-          $found = Select-String `
-            -Path zip-list.txt `
-            -Pattern 'Ladybird\.exe'
-
-          if (!$found) {
-            throw "Ladybird.exe missing from ZIP"
+          if (-not (Test-Path $zip)) {
+            throw "ZIP file was not created."
           }
 
-          Write-Host "ZIP integrity verified."
+          Get-Item $zip | Format-List FullName, Length
 
-      # ================================================
-      # 21. Generate SHA256
-      # ================================================
+      # --------------------------------------------------
+      # 13. SHA256
+      # --------------------------------------------------
 
-      - name: Generate SHA256 checksum
+      - name: Generate SHA256
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $zip = "dist/$env:PACKAGE_NAME.zip"
+          $hash = Get-FileHash $zip -Algorithm SHA256
 
-          $hash = Get-FileHash $env:PACKAGE_ZIP -Algorithm SHA256
+          "$($hash.Hash)  $([System.IO.Path]::GetFileName($zip))" |
+            Out-File "dist/$env:PACKAGE_NAME.sha256" -Encoding ascii
 
-          $line = "$($hash.Hash.ToLower())  $env:PACKAGE_ZIP"
+          Get-Content "dist/$env:PACKAGE_NAME.sha256"
 
-          $line | Out-File "$env:PACKAGE_ZIP.sha256" -Encoding ascii
+      # --------------------------------------------------
+      # 14. Upload ZIP
+      # --------------------------------------------------
 
-          Write-Host $line
-
-      # ================================================
-      # 22. Release notes
-      # ================================================
-
-      - name: Generate release notes
-        shell: pwsh
-        run: |
-          @"
-          # Ladybird Windows x64
-
-          Upstream revision: $env:UPSTREAM_SHA
-
-          ## CPU target
-
-          - Intended baseline: x86-64-v2
-          - SSE4.2 and POPCNT baseline
-          - AVX is not a baseline requirement
-          - AVX2 is not a baseline requirement
-          - AVX-512 is not a baseline requirement
-
-          ## Package
-
-          - Windows x64
-          - Portable ZIP
-          - Release build
-
-          ## Notice
-
-          Experimental third-party native Windows build.
-
-          Windows native Clang-CL support remains experimental upstream.
-
-          Third-party dependencies may have independent CPU requirements.
-          The CPU baseline setting does not independently verify every
-          third-party binary or runtime component.
-          "@ | Out-File release-notes.md -Encoding utf8
-
-      # ================================================
-      # 23. Upload successful build
-      # ================================================
-
-      - name: Upload build artifact
-        if: success()
+      - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Ladybird-Windows-x64-x86-64-v2
+          name: Ladybird-Windows-x64
           path: |
-            ${{ env.PACKAGE_ZIP }}
-            ${{ env.PACKAGE_ZIP }}.sha256
+            dist/Ladybird-Windows-x64.zip
+            dist/Ladybird-Windows-x64.sha256
           if-no-files-found: error
-          retention-days: 30
+          compression-level: 0
+          retention-days: 14
 
-      # ================================================
-      # 24. Publish GitHub prerelease
-      # ================================================
+      # --------------------------------------------------
+      # 15. Upload diagnostics
+      # --------------------------------------------------
 
-      - name: Publish GitHub prerelease
-        if: success() && inputs.publish_release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: windows-${{ github.run_number }}-${{ github.run_attempt }}
-          name: Ladybird Windows x64 Build ${{ github.run_number }}
-          body_path: release-notes.md
-          prerelease: true
-          files: |
-            ${{ env.PACKAGE_ZIP }}
-            ${{ env.PACKAGE_ZIP }}.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ================================================
-      # 25. Print failure information
-      # ================================================
-
-      - name: Print failure details
-        if: failure()
-        shell: pwsh
-        run: |
-          Write-Host "========== vcpkg environment =========="
-          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-          Write-Host "VCPKG_EXECUTABLE=$env:VCPKG_EXECUTABLE"
-
-          Write-Host "`n========== CMake cache =========="
-
-          if (Test-Path "Build/release/CMakeCache.txt") {
-            Select-String `
-              -Path "Build/release/CMakeCache.txt" `
-              -Pattern "VCPKG|ENABLE_CI_BASELINE_CPU|CMAKE_MAKE_PROGRAM"
-          }
-
-          Write-Host "`n========== vcpkg manifest log =========="
-
-          if (Test-Path "Build/release/vcpkg-manifest-install.log") {
-            Get-Content "Build/release/vcpkg-manifest-install.log" -Tail 250
-          }
-
-          Write-Host "`n========== nghttp2 overlay =========="
-
-          if (Test-Path "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake") {
-            Get-Content "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake"
-          }
-
-          Write-Host "`n========== issue_body.md files =========="
-
-          Get-ChildItem Build -Filter "issue_body.md" -File -Recurse -ErrorAction SilentlyContinue |
-            ForEach-Object {
-              Write-Host "`n--- $($_.FullName) ---"
-              Get-Content $_.FullName -Tail 200
-            }
-
-          Write-Host "`n========== vcpkg output logs =========="
-
-          Get-ChildItem Build -Filter "*-out.log" -File -Recurse -ErrorAction SilentlyContinue |
-            ForEach-Object {
-              Write-Host "`n--- $($_.FullName) ---"
-              Get-Content $_.FullName -Tail 100
-            }
-
-          Write-Host "`n========== disk space =========="
-
-          Get-PSDrive -PSProvider FileSystem
-
-      # ================================================
-      # 26. Upload diagnostic logs
-      # ================================================
-
-      - name: Collect diagnostic logs
-        if: failure()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $destination = Join-Path $pwd "diagnostics"
-
-          New-Item -ItemType Directory -Force $destination | Out-Null
-
-          $roots = @(
-            "Build/release",
-            "Build/vcpkg-release"
-          )
-
-          foreach ($root in $roots) {
-            if (!(Test-Path $root)) {
-              continue
-            }
-
-            Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -eq "vcpkg-manifest-install.log" -or
-                $_.Name -eq "issue_body.md" -or
-                $_.Name -like "*-out.log"
-              } |
-              ForEach-Object {
-                $relative = $_.FullName.Substring(
-                  (Resolve-Path $root).Path.Length
-                ).TrimStart("\","/")
-
-                $target = Join-Path $destination (
-                  (Split-Path $root -Leaf) + "\" + $relative
-                )
-
-                $parent = Split-Path $target -Parent
-
-                New-Item -ItemType Directory -Force $parent | Out-Null
-
-                Copy-Item $_.FullName $target -Force
-              }
-          }
-
-          if (Test-Path "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake") {
-            Copy-Item `
-              "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake" `
-              "$destination/nghttp2-overlay-portfile.cmake" `
-              -Force
-          }
-
-          if (Test-Path "Build/release/CMakeCache.txt") {
-            Copy-Item `
-              "Build/release/CMakeCache.txt" `
-              "$destination/CMakeCache.txt" `
-              -Force
-          }
-
-      - name: Upload vcpkg diagnostic logs
-        if: failure()
+      - name: Upload diagnostic logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Ladybird-vcpkg-debug-logs
+          name: Ladybird-Windows-Diagnostics
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 14
+
+      # --------------------------------------------------
+      # 16. GitHub Pre-release
+      # --------------------------------------------------
+
+      - name: Publish GitHub Pre-release
+        if: ${{ success() && inputs.publish_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-build-${{ github.run_number }}
+          name: Ladybird Windows x64 Build ${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/Ladybird-Windows-x64.zip
+            dist/Ladybird-Windows-x64.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
