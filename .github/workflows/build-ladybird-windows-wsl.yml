@@ -1,455 +1,240 @@
-
+```yaml
 name: Build Ladybird Windows x64
 
+# ================================================================
+# 只允许手动启动
+# 不会 push 自动编译
+# 不会 pull_request 自动编译
+# ================================================================
 on:
   workflow_dispatch:
     inputs:
-      source_branch:
-        description: "Ladybird source branch"
+      ref:
+        description: "Ladybird 分支 / Tag / Commit"
         required: true
         default: "master"
         type: string
 
+      publish_release:
+        description: "发布到 GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Windows x64 Release
-    runs-on: windows-latest
-    timeout-minutes: 360
+    name: Windows x64
 
-    env:
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.cache\vcpkg
-      VCPKG_DOWNLOADS: ${{ github.workspace }}\.cache\vcpkg-downloads
+    runs-on: windows-latest
+
+    timeout-minutes: 300
 
     steps:
+
+      # ============================================================
       # 1. 获取 Ladybird 源码
+      # ============================================================
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
           repository: LadybirdBrowser/ladybird
-          ref: ${{ inputs.source_branch }}
+          ref: ${{ inputs.ref }}
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
-      # 2. 安装 Python
+      - name: Show source revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host "Ladybird Windows x64 Build"
+          Write-Host "================================================"
+
+          Write-Host "Requested ref:"
+          Write-Host "${{ inputs.ref }}"
+
+          Write-Host ""
+          Write-Host "Actual commit:"
+          git log -1 --oneline
+
+          Write-Host ""
+          Write-Host "Repository:"
+          git remote -v
+
+          Write-Host "================================================"
+
+
+      # ============================================================
+      # 2. Python
+      #
+      # Ladybird 官方使用 ladybird.py
+      # ============================================================
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
 
-      # 3. 配置 MSVC x64 环境
-      - name: Setup MSVC environment
+
+      # ============================================================
+      # 3. Visual Studio / MSVC
+      #
+      # Windows runner 自带 VS。
+      # 使用官方推荐的 VS command environment。
+      # ============================================================
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # 4. 安装 LLVM、NASM、pkg-config
-      - name: Install build tools
+
+      # ============================================================
+      # 4. CMake
+      #
+      # 官方要求 >= 3.30
+      # 使用最新可用 CMake。
+      # ============================================================
+      - name: Setup latest CMake
+        uses: lukka/get-cmake@latest
+
+
+      # ============================================================
+      # 5. Ninja
+      #
+      # 使用 Chocolatey。
+      # ============================================================
+      - name: Install Ninja
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          choco install llvm nasm pkgconfiglite -y --no-progress
+          choco install ninja -y --no-progress
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Build tools installation failed"
-          }
-
-          $llvm = "C:\Program Files\LLVM\bin"
-
-          if (Test-Path $llvm) {
-            $llvm >> $env:GITHUB_PATH
-            $env:PATH = "$llvm;$env:PATH"
-          }
-
-          Write-Host "===== LLVM ====="
-          clang-cl --version
-
-          Write-Host "===== NASM ====="
-          nasm -v
-
-          Write-Host "===== MSVC ====="
-          cl
-
-      # 5. 安装 CMake、Ninja、aqtinstall
-      - name: Install Python build dependencies
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          python -m pip install --upgrade pip
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "pip upgrade failed"
-          }
-
-          python -m pip install --upgrade cmake ninja aqtinstall
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Python dependencies installation failed"
-          }
-
-          # 获取 Python Scripts 目录
-          $scripts = (
-            python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-          ).Trim()
-
-          if (!(Test-Path $scripts)) {
-            throw "Python Scripts directory not found: $scripts"
-          }
-
-          # 加入当前步骤和后续步骤 PATH
-          $scripts >> $env:GITHUB_PATH
-          $env:PATH = "$scripts;$env:PATH"
-
-          Write-Host "Python Scripts: $scripts"
-
-          Write-Host "===== CMake ====="
-          cmake --version
-
-          Write-Host "===== Ninja ====="
-          ninja --version
-
-          Write-Host "===== aqtinstall ====="
-          aqt version
-
-      # 6. 安装 Rust
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      # 7. Rust 缓存
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      # 8. 设置 Qt 版本
-      - name: Select Qt version
-        id: qt
-        shell: pwsh
-        run: |
-          $version = "6.10.3"
-
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "QT_VERSION=$version" >> $env:GITHUB_ENV
-
-          Write-Host "Qt version: $version"
-
-      # 9. 缓存 Qt
-      - name: Cache Qt
-        id: qt-cache
-        uses: actions/cache@v4
-        with:
-          path: C:\Qt
-          key: windows-qt-6.10.3-msvc2022-x64-v2
-
-      # 10. 安装 Qt
-      - name: Install Qt
-        if: steps.qt-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          aqt install-qt windows desktop 6.10.3 win64_msvc2022_64 `
-            -m qtpositioning `
-            -O C:\Qt
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Qt 6.10.3 installation failed"
-          }
-
-          Write-Host "Qt installation completed"
-
-      # 11. 配置 Qt 环境
-      - name: Configure Qt
-        shell: pwsh
-        run: |
-          $qt = "C:\Qt\6.10.3\msvc2022_64"
-
-          if (!(Test-Path $qt)) {
-            throw "Qt directory not found: $qt"
-          }
-
-          "QT_ROOT=$qt" >> $env:GITHUB_ENV
-          "CMAKE_PREFIX_PATH=$qt" >> $env:GITHUB_ENV
-          "$qt\bin" >> $env:GITHUB_PATH
-
-          Write-Host "Qt configured: $qt"
-
-      # 12. 缓存 vcpkg
-      - name: Cache vcpkg
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/vcpkg
-            .cache/vcpkg-downloads
-          key: windows-vcpkg-${{ hashFiles('**/vcpkg.json', '**/vcpkg-configuration.json') }}
-          restore-keys: |
-            windows-vcpkg-
-
-      # 13. 创建 vcpkg 缓存目录
-      - name: Prepare vcpkg cache directories
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $cache = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg"
-          $downloads = Join-Path $env:GITHUB_WORKSPACE ".cache\vcpkg-downloads"
-
-          New-Item -ItemType Directory -Force -Path $cache | Out-Null
-          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
-
-          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
-          "VCPKG_DOWNLOADS=$downloads" >> $env:GITHUB_ENV
-
-          if (!(Test-Path $cache -PathType Container)) {
-            throw "vcpkg binary cache directory creation failed"
-          }
-
-          if (!(Test-Path $downloads -PathType Container)) {
-            throw "vcpkg downloads directory creation failed"
-          }
-
-          Write-Host "vcpkg cache: $cache"
-          Write-Host "vcpkg downloads: $downloads"
-
-      # 14. 检查所有编译环境
-      - name: Verify build environment
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "===== Compiler ====="
-          clang-cl --version
-          cl
-
-          Write-Host "===== CMake ====="
-          cmake --version
-
-          Write-Host "===== Ninja ====="
           $ninja = Get-Command ninja -ErrorAction SilentlyContinue
 
-          if (!$ninja) {
-            throw "Ninja executable not found in PATH"
+          if (-not $ninja) {
+            throw "Ninja was not found after installation"
           }
 
-          Write-Host "Ninja path: $($ninja.Source)"
+          Write-Host "Ninja:"
           ninja --version
 
-          Write-Host "===== Rust ====="
+
+      # ============================================================
+      # 6. pkg-config
+      #
+      # Ladybird 官方 Windows Clang-CL 文档明确要求：
+      #
+      # choco install pkgconfiglite -y
+      # ============================================================
+      - name: Install pkg-config
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install pkgconfiglite -y --no-progress
+
+          $pkg = Get-Command pkg-config -ErrorAction SilentlyContinue
+
+          if (-not $pkg) {
+            $pkg = Get-Command pkgconf -ErrorAction SilentlyContinue
+          }
+
+          if (-not $pkg) {
+            throw "pkg-config was not found"
+          }
+
+          Write-Host "pkg-config:"
+          pkg-config --version
+
+
+      # ============================================================
+      # 7. Rust
+      #
+      # 官方要求 Rust toolchain。
+      #
+      # 不使用不存在的：
+      # rust-lang/rust-toolchain
+      #
+      # 直接使用官方 rustup-init。
+      # ============================================================
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rustup = "$env:USERPROFILE\.cargo\bin\rustup.exe"
+
+          if (-not (Test-Path $rustup)) {
+
+            Write-Host "Installing Rustup..."
+
+            Invoke-WebRequest `
+              -Uri "https://win.rustup.rs/x86_64" `
+              -OutFile "$env:RUNNER_TEMP\rustup-init.exe"
+
+            & "$env:RUNNER_TEMP\rustup-init.exe" `
+              -y `
+              --default-toolchain stable `
+              --profile minimal
+          }
+
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+
+          if ($env:GITHUB_PATH -and (Test-Path $cargoBin)) {
+            $cargoBin | Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+          }
+
+          $env:PATH = "$cargoBin;$env:PATH"
+
+          rustc --version
+          cargo --version
+          rustup --version
+
+
+      # ============================================================
+      # 8. 工具链检查
+      # ============================================================
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "================ TOOLCHAIN ================"
+
+          Write-Host ""
+          Write-Host "Python:"
+          python --version
+
+          Write-Host ""
+          Write-Host "CMake:"
+          cmake --version
+
+          Write-Host ""
+          Write-Host "Ninja:"
+          ninja --version
+
+          Write-Host ""
+          Write-Host "Clang:"
+          clang-cl --version
+
+          Write-Host ""
+          Write-Host "MSVC:"
+          cl.exe
+
+          Write-Host ""
+          Write-Host "Rust:"
           rustc --version
           cargo --version
 
-          Write-Host "===== Qt ====="
-          qmake --version
-
-          Write-Host "===== aqtinstall ====="
-          aqt version
-
-          Write-Host "===== vcpkg cache ====="
-
-          if (!(Test-Path $env:VCPKG_DEFAULT_BINARY_CACHE -PathType Container)) {
-            throw "vcpkg binary cache directory missing"
-          }
-
-          if (!(Test-Path $env:VCPKG_DOWNLOADS -PathType Container)) {
-            throw "vcpkg downloads directory missing"
-          }
-
-          Write-Host "vcpkg cache ready"
-
-      # 15. 编译 Ladybird
-      - name: Build Ladybird
-        shell: pwsh
-        env:
-          CC: clang-cl
-          CXX: clang-cl
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # 再次确认 Ninja
-          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
-
-          if (!$ninja) {
-            throw "Ninja is unavailable before compilation"
-          }
-
-          # 确保 vcpkg 缓存目录存在
-          New-Item -ItemType Directory -Force `
-            -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-
-          New-Item -ItemType Directory -Force `
-            -Path $env:VCPKG_DOWNLOADS | Out-Null
-
-          # 自动计算并行任务
-          $cpu = [Environment]::ProcessorCount
-
-          $memory = [math]::Floor(
-            (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
-          )
-
-          $jobs = [math]::Min(
-            $cpu,
-            [math]::Max(1, [math]::Floor($memory / 3))
-          )
-
-          $env:CMAKE_BUILD_PARALLEL_LEVEL = "$jobs"
-          $env:VCPKG_MAX_CONCURRENCY = "$jobs"
-
-          Write-Host "===== Build Configuration ====="
-          Write-Host "CPU cores: $cpu"
-          Write-Host "Memory: $memory GB"
-          Write-Host "Parallel jobs: $jobs"
-          Write-Host "Ninja: $($ninja.Source)"
-          Write-Host "vcpkg cache: $env:VCPKG_DEFAULT_BINARY_CACHE"
-
-          Write-Host "===== Start Ladybird Build ====="
-
-          py Meta\ladybird.py build
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Ladybird compilation failed: $LASTEXITCODE"
-          }
-
-      # 16. 收集编译产物
-      - name: Package Ladybird
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $build = Join-Path $env:GITHUB_WORKSPACE "Build\release"
-          $stage = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
-          $bin = Join-Path $stage "bin"
-
-          if (!(Test-Path "$build\bin")) {
-            throw "Build\release\bin not found"
-          }
-
-          New-Item -ItemType Directory -Force -Path $bin | Out-Null
-
-          # 复制编译目录
-          Copy-Item "$build\bin\*" $bin -Recurse -Force
-
-          # 执行 CMake 安装规则
-          $install = Join-Path $env:RUNNER_TEMP "ladybird-install"
-
-          New-Item -ItemType Directory -Force -Path $install | Out-Null
-
-          cmake --install $build --prefix $install
-
-          if ($LASTEXITCODE -eq 0) {
-            Copy-Item "$install\*" $stage -Recurse -Force
-          } else {
-            Write-Warning "CMake install failed; using build output"
-          }
-
-          # 收集 vcpkg DLL
-          $vcpkgBin = "$build\vcpkg_installed\x64-windows\bin"
-
-          if (Test-Path $vcpkgBin) {
-            Get-ChildItem $vcpkgBin -Filter "*.dll" -File |
-              Copy-Item -Destination $bin -Force
-          }
-
-          # 收集可能存在的资源目录
-          $resourceDirs = @(
-            "share",
-            "res",
-            "resources",
-            "Base",
-            "UI"
-          )
-
-          foreach ($dir in $resourceDirs) {
-            $source = Join-Path $build $dir
-
-            if (Test-Path $source) {
-              Copy-Item $source $stage -Recurse -Force
-            }
-          }
-
-          # 查找 Ladybird.exe
-          $mainExe = Join-Path $bin "Ladybird.exe"
-
-          if (!(Test-Path $mainExe)) {
-            $found = Get-ChildItem $bin -Filter "Ladybird.exe" -Recurse |
-              Select-Object -First 1
-
-            if ($found) {
-              $mainExe = $found.FullName
-            } else {
-              throw "Ladybird.exe not found in build output"
-            }
-          }
-
-          # 部署 Qt 运行库
-          $windeployqt = Join-Path $env:QT_ROOT "bin\windeployqt.exe"
-
-          if (!(Test-Path $windeployqt)) {
-            throw "windeployqt.exe not found"
-          }
-
-          & $windeployqt --release --compiler-runtime --no-translations $mainExe
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Qt deployment failed"
-          }
-
-          Write-Host "===== Package Contents ====="
-
-          Get-ChildItem $stage -Recurse -File |
-            Select-Object FullName, Length
-
-      # 17. 创建 ZIP
-      - name: Create Windows ZIP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $stage = Join-Path $env:GITHUB_WORKSPACE "dist\Ladybird"
-          $zip = Join-Path $env:GITHUB_WORKSPACE "Ladybird-Windows-x64.zip"
-
-          if (!(Test-Path $stage)) {
-            throw "Package directory not found"
-          }
-
-          if (Test-Path $zip) {
-            Remove-Item $zip -Force
-          }
-
-          $sevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
-
-          if ($sevenZip) {
-            7z a -tzip -mx=1 $zip "$stage\*"
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "7-Zip compression failed"
-            }
-          } else {
-            Add-Type -AssemblyName System.IO.Compression
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-            [System.IO.Compression.ZipFile]::CreateFromDirectory(
-              $stage,
-              $zip,
-              [System.IO.Compression.CompressionLevel]::Fastest,
-              $false
-            )
-          }
-
-          if (!(Test-Path $zip)) {
-            throw "ZIP file was not created"
-          }
-
-          Get-Item $zip | Select-Object Name, Length
-
-      # 18. 上传编译产物
-      - name: Upload Windows Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Ladybird-Windows-x64
-          path: Ladybird-Windows-x64.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
+          Write-Host ""
+          Write-Host "pkg
