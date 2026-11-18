@@ -1,156 +1,512 @@
 
-name: Analyze Ladybird Artifact
+name: Build Ladybird Windows x64
 
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "GitHub Actions run ID"
+      ref:
+        description: "Ladybird Git ref / branch / tag"
         required: true
-        default: "44169988377"
+        default: "master"
         type: string
-      artifact_name:
-        description: "Artifact name"
+
+      publish_release:
+        description: "Publish official GitHub Release"
         required: true
-        default: "Ladybird-Windows-x64"
-        type: string
+        default: true
+        type: boolean
 
 permissions:
-  actions: read
-  contents: read
+  contents: write
+
+concurrency:
+  group: ladybird-windows-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  analyze:
-    runs-on: windows-latest
+  build:
+    name: Build Ladybird Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    env:
+      VCPKG_MAX_CONCURRENCY: "4"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+      CC: clang-cl
+      CXX: clang-cl
 
     steps:
-      - name: Download existing artifact
+      # 1. Checkout
+      - name: Checkout Ladybird
+        uses: actions/checkout@v4
+        with:
+          repository: LadybirdBrowser/ladybird
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      # 2. Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 3. MSVC
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # 4. Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+
+      - name: Verify Rust
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          rustc --version
+          cargo --version
+
+      # 5. Build dependencies
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          choco install llvm ninja nasm pkgconfiglite 7zip -y
+          python -m pip install --upgrade pip
+          python -m pip install cmake
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          clang-cl --version
+          cmake --version
+          ninja --version
+          nasm -v
+          python --version
+
+      # 6. Cache
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: .cache/vcpkg
+          key: ladybird-vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            ladybird-vcpkg-windows-x64-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .cache/ccache
+          key: ladybird-ccache-windows-${{ github.sha }}
+          restore-keys: |
+            ladybird-ccache-windows-
+
+      # 7. Build
+      - name: Build Ladybird
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          gh run download "$env:RUN_ID" `
-            --repo "$env:GITHUB_REPOSITORY" `
-            --name "$env:ARTIFACT_NAME" `
-            --dir "$env:RUNNER_TEMP\ladybird-artifact"
+          $env:CC = "clang-cl"
+          $env:CXX = "clang-cl"
 
-      - name: Analyze ZIP contents
+          py Meta\ladybird.py build
+
+          if (!(Test-Path "Build\release")) {
+            throw "Build\release was not generated."
+          }
+
+      # 8. Verify executable
+      - name: Verify build output
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-          $root = "$env:RUNNER_TEMP\ladybird-artifact"
-          $zip = Get-ChildItem $root -Recurse -Filter "Ladybird-Windows-x64.zip" |
+          $exe = Get-ChildItem "Build\release" -Filter "Ladybird.exe" -File -Recurse |
             Select-Object -First 1
 
-          if (-not $zip) {
-            throw "Ladybird-Windows-x64.zip was not found."
+          if (!$exe) {
+            throw "Ladybird.exe not found."
           }
 
-          $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
-          $report = [System.Collections.Generic.List[string]]::new()
+          Write-Host "Found executable: $($exe.FullName)"
+
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "Invalid PE executable."
+          }
+
+          $stream = [System.IO.File]::OpenRead($exe.FullName)
+          $reader = New-Object System.IO.BinaryReader($stream)
+
+          $stream.Position = 0x3C
+          $peOffset = $reader.ReadInt32()
+
+          $stream.Position = $peOffset
+          $signature = $reader.ReadUInt32()
+          $machine = $reader.ReadUInt16()
+
+          $reader.Close()
+          $stream.Close()
+
+          if ($signature -ne 0x00004550) {
+            throw "Invalid PE signature."
+          }
+
+          if ($machine -ne 0x8664) {
+            throw "Executable is not Windows x64."
+          }
+
+      # 9. Install
+      - name: Install Ladybird
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "Install") {
+            Remove-Item "Install" -Recurse -Force
+          }
+
+          cmake --install Build\release --strip --prefix Install
+
+          if (!(Test-Path "Install\bin")) {
+            New-Item -ItemType Directory -Force "Install\bin" | Out-Null
+          }
+
+          $exe = Get-ChildItem "Install" -Filter "Ladybird.exe" -File -Recurse |
+            Select-Object -First 1
+
+          if (!$exe) {
+            throw "Ladybird.exe missing from install tree."
+          }
+
+          Write-Host "Installed executable: $($exe.FullName)"
+
+      # 10. Locate vcpkg
+      - name: Locate vcpkg runtime
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidates = @(
+            "Build\release\vcpkg_installed",
+            "Build\vcpkg_installed"
+          )
+
+          $root = $null
+
+          foreach ($candidate in $candidates) {
+            if (Test-Path $candidate) {
+              $root = (Resolve-Path $candidate).Path
+              break
+            }
+          }
+
+          if (!$root) {
+            $found = Get-ChildItem "Build" -Directory -Recurse |
+              Where-Object { $_.Name -eq "vcpkg_installed" } |
+              Select-Object -First 1
+
+            if ($found) {
+              $root = $found.FullName
+            }
+          }
+
+          if (!$root) {
+            throw "vcpkg_installed directory not found."
+          }
+
+          $triplet = Join-Path $root "x64-windows"
+          $bin = Join-Path $triplet "bin"
+
+          if (!(Test-Path $bin)) {
+            throw "x64-windows/bin not found: $bin"
+          }
+
+          "VCPKG_ROOT=$root" >> $env:GITHUB_OUTPUT
+          "VCPKG_BIN=$bin" >> $env:GITHUB_OUTPUT
+
+          Write-Host "vcpkg root: $root"
+          Write-Host "vcpkg bin: $bin"
+
+      # 11. Bundle runtime
+      - name: Bundle Windows runtime DLLs
+        shell: pwsh
+        env:
+          VCPKG_BIN: ${{ steps.vcpkg.outputs.VCPKG_BIN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installBin = Join-Path $PWD "Install\bin"
+          New-Item -ItemType Directory -Force $installBin | Out-Null
+
+          # Copy all vcpkg Release DLLs
+          $vcpkgDlls = Get-ChildItem $env:VCPKG_BIN -Filter "*.dll" -File
+
+          if (!$vcpkgDlls) {
+            throw "No DLL files found in vcpkg bin."
+          }
+
+          foreach ($dll in $vcpkgDlls) {
+            Copy-Item $dll.FullName $installBin -Force
+          }
+
+          Write-Host "Copied vcpkg DLL count: $($vcpkgDlls.Count)"
+
+          # Copy build output DLLs
+          $buildBin = "Build\release\bin"
+
+          if (Test-Path $buildBin) {
+            Get-ChildItem $buildBin -Filter "*.dll" -File -Recurse |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](debug|Debug)[\\/]'
+              } |
+              ForEach-Object {
+                $destination = Join-Path $installBin $_.Name
+
+                if (!(Test-Path $destination)) {
+                  Copy-Item $_.FullName $destination -Force
+                }
+              }
+          }
+
+          # Locate Qt platform plugin
+          $qwindows = Get-ChildItem "Build" -Filter "qwindows.dll" -File -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](debug|Debug)[\\/]'
+            } |
+            Select-Object -First 1
+
+          if (!$qwindows) {
+            throw "Qt qwindows.dll not found."
+          }
+
+          $pluginRoot = $qwindows.Directory.Parent.FullName
+
+          Write-Host "Qt plugin root: $pluginRoot"
+
+          # Copy Qt plugin categories
+          Get-ChildItem $pluginRoot -Directory |
+            Where-Object {
+              $_.Name -notmatch '^(debug|Debug)$'
+            } |
+            ForEach-Object {
+              $category = $_.Name
+              $target = Join-Path $installBin $category
+
+              New-Item -ItemType Directory -Force $target | Out-Null
+
+              Copy-Item "$($_.FullName)\*" $target -Recurse -Force
+            }
+
+          # Ensure qwindows.dll
+          if (!(Test-Path "$installBin\platforms\qwindows.dll")) {
+            New-Item -ItemType Directory -Force "$installBin\platforms" | Out-Null
+            Copy-Item $qwindows.FullName "$installBin\platforms\qwindows.dll" -Force
+          }
+
+          # Copy helper executables
+          $libexec = "Install\libexec"
+
+          if (Test-Path $libexec) {
+            Get-ChildItem $libexec -Filter "*.exe" -File |
+              ForEach-Object {
+                Copy-Item $_.FullName $installBin -Force
+              }
+
+            if (!(Get-ChildItem $libexec -Force)) {
+              Remove-Item $libexec -Force
+            }
+          }
+
+          Write-Host "Runtime DLL collection complete."
+
+      # 12. Validate
+      - name: Validate runtime files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bin = "Install\bin"
+
+          $required = @(
+            "Qt6Core.dll",
+            "Qt6Gui.dll",
+            "Qt6Widgets.dll",
+            "Qt6Positioning.dll",
+            "libz.dll",
+            "cpptrace.dll"
+          )
+
+          foreach ($name in $required) {
+            $file = Join-Path $bin $name
+
+            if (!(Test-Path $file)) {
+              throw "Missing runtime DLL: $name"
+            }
+
+            Write-Host "OK: $name"
+          }
+
+          if (!(Test-Path "$bin\platforms\qwindows.dll")) {
+            throw "Missing Qt platform plugin."
+          }
+
+          $exe = Get-ChildItem "Install" -Filter "Ladybird.exe" -File -Recurse |
+            Select-Object -First 1
+
+          if (!$exe) {
+            throw "Ladybird.exe missing."
+          }
+
+          Write-Host "All required runtime files verified."
+
+      # 13. Cleanup
+      - name: Clean development files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = "Install"
+
+          Get-ChildItem $root -File -Recurse |
+            Where-Object {
+              $_.Extension -in @(".pdb", ".ilk", ".obj", ".exp")
+            } |
+            Remove-Item -Force
+
+          foreach ($dir in @("include", "lib")) {
+            $path = Join-Path $root $dir
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
+          }
+
+          Write-Host "Package cleanup completed."
+
+      # 14. DLL report
+      - name: Generate DLL report
+        shell: pwsh
+        env:
+          VCPKG_BIN: ${{ steps.vcpkg.outputs.VCPKG_BIN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          "=== INSTALLED DLL INVENTORY ===" |
+            Out-File dll-report.txt
+
+          Get-ChildItem "Install" -Filter "*.dll" -File -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Out-File dll-report.txt -Append
+
+          "`n=== VCPKG DLL INVENTORY ===" |
+            Out-File dll-report.txt -Append
+
+          Get-ChildItem $env:VCPKG_BIN -Filter "*.dll" -File |
+            Select-Object Name, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Out-File dll-report.txt -Append
+
+          Write-Host "DLL report generated."
+
+      # 15. ZIP
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "Ladybird-Windows-x64.zip") {
+            Remove-Item "Ladybird-Windows-x64.zip" -Force
+          }
+
+          Compress-Archive `
+            -Path "Install\*" `
+            -DestinationPath "Ladybird-Windows-x64.zip" `
+            -CompressionLevel Optimal
+
+          if (!(Test-Path "Ladybird-Windows-x64.zip")) {
+            throw "ZIP package was not generated."
+          }
+
+          Write-Host "ZIP size:"
+          (Get-Item "Ladybird-Windows-x64.zip").Length
+
+      # 16. Verify ZIP
+      - name: Verify ZIP contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zip = [System.IO.Compression.ZipFile]::OpenRead(
+            (Resolve-Path "Ladybird-Windows-x64.zip")
+          )
 
           try {
-            $entries = @($archive.Entries | Where-Object {
-              $_.Name -ne ""
-            })
-
-            $total = ($entries | Measure-Object Length -Sum).Sum
-            $compressed = ($entries | Measure-Object CompressedLength -Sum).Sum
-
-            $report.Add("LADYBIRD WINDOWS ZIP SIZE REPORT")
-            $report.Add("================================")
-            $report.Add("Archive: $($zip.FullName)")
-            $report.Add("Files: $($entries.Count)")
-            $report.Add("Uncompressed: $([math]::Round($total / 1GB, 3)) GB")
-            $report.Add("Compressed entries: $([math]::Round($compressed / 1MB, 2)) MB")
-            $report.Add("")
-
-            $report.Add("TOP 50 LARGEST FILES")
-            $report.Add("--------------------")
-            foreach ($e in ($entries | Sort-Object Length -Descending | Select-Object -First 50)) {
-              $report.Add(("{0,10:N2} MB | {1}" -f ($e.Length / 1MB), $e.FullName))
-            }
-
-            $report.Add("")
-            $report.Add("SIZE BY FILE EXTENSION")
-            $report.Add("----------------------")
-            $groups = $entries | Group-Object {
-              $ext = [IO.Path]::GetExtension($_.Name).ToLowerInvariant()
-              if ($ext) { $ext } else { "[no extension]" }
-            } | ForEach-Object {
-              [pscustomobject]@{
-                Extension = $_.Name
-                Count = $_.Count
-                Bytes = ($_.Group | Measure-Object Length -Sum).Sum
-              }
-            } | Sort-Object Bytes -Descending
-
-            foreach ($g in $groups) {
-              $report.Add(("{0,-16} {1,7} files {2,10:N2} MB" -f $g.Extension, $g.Count, ($g.Bytes / 1MB)))
-            }
-
-            $report.Add("")
-            $report.Add("DEBUG / BUILD FILES")
-            $report.Add("-------------------")
-            $debug = @($entries | Where-Object {
-              $_.Name -match '\.(pdb|ilk|obj|exp|lib|pch|idb)$'
-            })
-            $debugBytes = ($debug | Measure-Object Length -Sum).Sum
-            $report.Add("Count: $($debug.Count)")
-            $report.Add("Total: $([math]::Round($debugBytes / 1MB, 2)) MB")
-            foreach ($e in ($debug | Sort-Object Length -Descending | Select-Object -First 30)) {
-              $report.Add(("{0,10:N2} MB | {1}" -f ($e.Length / 1MB), $e.FullName))
-            }
-
-            $report.Add("")
-            $report.Add("DUPLICATE FILE CONTENTS (SHA256)")
-            $report.Add("--------------------------------")
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try {
-              $hashRows = foreach ($e in $entries) {
-                $stream = $e.Open()
-                try {
-                  $hash = [Convert]::ToHexString($sha.ComputeHash($stream))
-                  [pscustomobject]@{
-                    Hash = $hash
-                    Path = $e.FullName
-                    Size = $e.Length
-                  }
-                } finally {
-                  $stream.Dispose()
-                }
-              }
-
-              $duplicates = $hashRows | Group-Object Hash | Where-Object Count -gt 1
-              $report.Add("Duplicate groups: $($duplicates.Count)")
-              foreach ($d in $duplicates) {
-                $report.Add("")
-                $report.Add("SHA256: $($d.Name)")
-                foreach ($item in $d.Group) {
-                  $report.Add("  $($item.Path)")
-                }
-              }
-            } finally {
-              $sha.Dispose()
-            }
-
-          } finally {
-            $archive.Dispose()
+            $entries = @($zip.Entries.FullName)
+          }
+          finally {
+            $zip.Dispose()
           }
 
-          $report | Set-Content "$env:GITHUB_WORKSPACE\Ladybird-Size-Report.txt" -Encoding UTF8
-          $report | ForEach-Object { Write-Host $_ }
+          $required = @(
+            "bin/Ladybird.exe",
+            "bin/Qt6Core.dll",
+            "bin/Qt6Gui.dll",
+            "bin/Qt6Widgets.dll",
+            "bin/Qt6Positioning.dll",
+            "bin/libz.dll",
+            "bin/cpptrace.dll",
+            "bin/platforms/qwindows.dll"
+          )
 
-      - name: Upload size report
+          foreach ($item in $required) {
+            if ($entries -notcontains $item) {
+              throw "ZIP missing: $item"
+            }
+
+            Write-Host "ZIP OK: $item"
+          }
+
+          Write-Host "ZIP verification completed."
+
+      # 17. Upload artifact
+      - name: Upload Ladybird artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Ladybird-Size-Report
-          path: Ladybird-Size-Report.txt
+          name: Ladybird-Windows-x64
+          path: |
+            Ladybird-Windows-x64.zip
+            dll-report.txt
+          if-no-files-found: error
           retention-days: 14
+
+      # 18. Generate release tag
+      - name: Generate release tag
+        id: release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        run: |
+          $tag = "windows-$(Get-Date -Format 'yyyyMMdd-HHmmss')-${{ github.run_number }}"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: $tag"
+
+      # 19. Publish official Release
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Ladybird Windows x64 ${{ steps.release.outputs.tag }}
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            Ladybird-Windows-x64.zip
+            dll-report.txt
