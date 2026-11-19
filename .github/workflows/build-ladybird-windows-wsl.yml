@@ -287,8 +287,6 @@ jobs:
             $ladybird `
             "Meta/CMake/vcpkg/release-triplets"
 
-          # Verify all required paths.
-
           if (!(Test-Path $toolchain)) {
             throw "Local vcpkg toolchain not found: $toolchain"
           }
@@ -307,10 +305,11 @@ jobs:
             Select-Object Name
 
           Write-Host "===== Overlay Ports ====="
-
           Write-Host $overlayPorts
+
           Write-Host "===== vcpkg ====="
           Write-Host $vcpkg
+
           Write-Host "===== Toolchain ====="
           Write-Host $toolchain
 
@@ -361,35 +360,67 @@ jobs:
             throw "CMakeCache.txt was not generated."
           }
 
-          $content = Get-Content $cache -Raw
+          $lines = Get-Content $cache
 
-          $checks = @(
-            "CMAKE_TOOLCHAIN_FILE:FILEPATH=.*\.vcpkg-upstream",
-            "Z_VCPKG_ROOT_DIR:INTERNAL=.*\.vcpkg-upstream",
-            "VCPKG_TARGET_TRIPLET:STRING=x64-windows",
-            "VCPKG_OVERLAY_TRIPLETS:STRING=.*release-triplets",
-            "LADYBIRD_BASELINE_CPU_TARGET:UNINITIALIZED=ON"
-          )
+          function Get-CMakeCacheValue {
+            param([string]$Name)
 
-          foreach ($check in $checks) {
-            if ($content -notmatch $check) {
-              throw "CMakeCache validation failed: $check"
+            $pattern = "^$([regex]::Escape($Name)):[^=]+=(.*)$"
+
+            $line = $lines |
+              Where-Object { $_ -match $pattern } |
+              Select-Object -First 1
+
+            if ($null -eq $line) {
+              return $null
             }
+
+            return ($line -replace '^.*?=', '')
           }
 
-          Write-Host "===== CMakeCache ====="
+          $toolchain = Get-CMakeCacheValue "CMAKE_TOOLCHAIN_FILE"
+          $vcpkgRoot = Get-CMakeCacheValue "Z_VCPKG_ROOT_DIR"
+          $triplet = Get-CMakeCacheValue "VCPKG_TARGET_TRIPLET"
+          $overlayPorts = Get-CMakeCacheValue "VCPKG_OVERLAY_PORTS"
+          $overlayTriplets = Get-CMakeCacheValue "VCPKG_OVERLAY_TRIPLETS"
+          $baseline = Get-CMakeCacheValue "LADYBIRD_BASELINE_CPU_TARGET"
 
-          Select-String -Path $cache -Pattern `
-            "CMAKE_TOOLCHAIN_FILE",
-            "Z_VCPKG_ROOT_DIR",
-            "VCPKG_ROOT",
-            "VCPKG_MANIFEST_DIR",
-            "VCPKG_OVERLAY_PORTS",
-            "VCPKG_OVERLAY_TRIPLETS",
-            "VCPKG_TARGET_TRIPLET",
-            "CMAKE_GENERATOR",
-            "LADYBIRD_BASELINE_CPU_TARGET",
-            "CMAKE_BUILD_TYPE"
+          Write-Host "===== CMake configuration ====="
+
+          Write-Host "Toolchain: $toolchain"
+          Write-Host "vcpkg root: $vcpkgRoot"
+          Write-Host "Target triplet: $triplet"
+          Write-Host "Overlay ports: $overlayPorts"
+          Write-Host "Overlay triplets: $overlayTriplets"
+          Write-Host "CPU baseline: $baseline"
+
+          if (!$toolchain -or $toolchain -notmatch '\.vcpkg-upstream') {
+            throw "CMake is not using the local vcpkg toolchain."
+          }
+
+          if (!$vcpkgRoot -or $vcpkgRoot -notmatch '\.vcpkg-upstream') {
+            throw "CMake is not using the local vcpkg root."
+          }
+
+          if ($triplet -ne "x64-windows") {
+            throw "Unexpected vcpkg target triplet: $triplet"
+          }
+
+          if (!$overlayPorts -or $overlayPorts -notmatch 'overlay-ports') {
+            throw "Ladybird overlay ports were not configured."
+          }
+
+          if (!$overlayTriplets -or $overlayTriplets -notmatch 'release-triplets') {
+            throw "Ladybird release triplets were not configured."
+          }
+
+          # This variable may not be stored in CMakeCache.
+          # If it is stored, verify its value.
+          if ($null -ne $baseline -and $baseline -ne "ON") {
+            throw "CPU baseline has an unexpected value: $baseline"
+          }
+
+          Write-Host "CMake configuration validation passed."
 
       # ------------------------------------------------------------
       # 13. Build Ladybird
@@ -468,8 +499,6 @@ jobs:
 
           Write-Host "Cleaning $release"
 
-          # Intermediate development files.
-
           $extensions = @(
             ".obj",
             ".o",
@@ -496,8 +525,6 @@ jobs:
                 -ErrorAction SilentlyContinue
             }
 
-          # Build and test directories.
-
           $directoryNames = @(
             "CMakeFiles",
             "Testing",
@@ -515,8 +542,6 @@ jobs:
               Remove-Item $_.FullName -Recurse -Force `
                 -ErrorAction SilentlyContinue
             }
-
-          # CMake and Ninja metadata.
 
           $metadataNames = @(
             "CMakeCache.txt",
@@ -538,8 +563,6 @@ jobs:
                 -ErrorAction SilentlyContinue
             }
 
-          # Visual Studio project metadata.
-
           $metadataExtensions = @(
             ".sln",
             ".vcxproj",
@@ -555,8 +578,6 @@ jobs:
               Remove-Item $_.FullName -Force `
                 -ErrorAction SilentlyContinue
             }
-
-          # Common test executable names only.
 
           Get-ChildItem $release -Recurse -File -Filter *.exe |
             Where-Object {
@@ -700,8 +721,6 @@ jobs:
               }
           }
 
-          # Collect CMake manifest install log.
-
           $manifestLog = Join-Path `
             $env:GITHUB_WORKSPACE `
             "ladybird/Build/release/vcpkg-manifest-install.log"
@@ -711,8 +730,6 @@ jobs:
               (Join-Path $output "vcpkg-manifest-install.log") `
               -Force
           }
-
-          # Collect CMake cache.
 
           $cache = Join-Path `
             $env:GITHUB_WORKSPACE `
