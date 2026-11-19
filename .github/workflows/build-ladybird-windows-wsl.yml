@@ -39,8 +39,6 @@ jobs:
       CARGO_BUILD_JOBS: 4
       VCPKG_DISABLE_METRICS: 1
       PYTHONUTF8: 1
-      BUILD_DIR: Build/release
-      PACKAGE_DIR: dist/Ladybird
       PACKAGE_NAME: Ladybird-Windows-x64
 
     steps:
@@ -110,32 +108,48 @@ jobs:
       - name: Verify toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           clang-cl --version
           clang --version
           cmake --version
-          ninja --version
           python --version
           rustc --version
           cargo --version
+
+          $ninjaCommand = Get-Command ninja.exe -ErrorAction Stop
+          $ninjaPath = $ninjaCommand.Source
+
+          if (-not (Test-Path $ninjaPath)) {
+            throw "Ninja executable does not exist: $ninjaPath"
+          }
+
+          Write-Host "Ninja executable: $ninjaPath"
+          & $ninjaPath --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ninja verification failed."
+          }
+
+          "NINJA_PATH=$ninjaPath" |
+            Out-File diagnostics/toolchain.txt -Append
 
       # --------------------------------------------------
       # 3. Cache
       # --------------------------------------------------
 
-      - name: Cache vcpkg
+      - name: Cache vcpkg downloads
         uses: actions/cache@v4
         with:
           path: |
             .cache/vcpkg
-            Build/vcpkg
-            Build/vcpkg-release
-            Build/release/vcpkg_installed
-          key: ladybird-vcpkg-${{ runner.os }}-${{ hashFiles('Meta/CMake/vcpkg.json', 'Meta/CMake/vcpkg-configuration.json') }}
+            C:/Users/runneradmin/AppData/Local/vcpkg/archives
+          key: ladybird-vcpkg-downloads-${{ runner.os }}-${{ hashFiles('Meta/CMake/vcpkg.json', 'Meta/CMake/vcpkg-configuration.json') }}
           restore-keys: |
-            ladybird-vcpkg-${{ runner.os }}-
+            ladybird-vcpkg-downloads-${{ runner.os }}-
 
       # --------------------------------------------------
-      # 4. Clean build
+      # 4. Clean
       # --------------------------------------------------
 
       - name: Clean previous build
@@ -145,7 +159,8 @@ jobs:
           $paths = @(
             "Build/release",
             "Build/vcpkg-release",
-            "dist/Ladybird"
+            "dist/Ladybird",
+            ".vcpkg-upstream"
           )
 
           foreach ($path in $paths) {
@@ -173,54 +188,190 @@ jobs:
                 Out-File diagnostics/cpu-baseline-source.txt -Append
 
               Select-String -Path $file `
-                -Pattern "LADYBIRD_BASELINE_CPU_TARGET|ENABLE_CI_BASELINE_CPU|x86-64-v2|target-cpu|march|/arch" `
+                -Pattern "LADYBIRD_BASELINE_CPU_TARGET|x86-64-v2|target-cpu|march|/arch" `
                 -Context 4,8 |
                 Out-File diagnostics/cpu-baseline-source.txt -Append
             }
           }
 
-          $found = Select-String `
-            -Path "Meta/CMake/*.cmake" `
-            -Pattern "LADYBIRD_BASELINE_CPU_TARGET" `
-            -ErrorAction SilentlyContinue
+          $found = Get-ChildItem Meta/CMake -Filter "*.cmake" -Recurse |
+            Select-String -Pattern "LADYBIRD_BASELINE_CPU_TARGET" `
+              -ErrorAction SilentlyContinue
 
           if (-not $found) {
-            throw "Could not find LADYBIRD_BASELINE_CPU_TARGET in Meta/CMake."
+            throw "CPU baseline option was not found in Ladybird source."
           }
 
-          Write-Host "Ladybird CPU baseline option found in source."
+      # --------------------------------------------------
+      # 6. Prepare matching vcpkg source tree for overlay
+      # --------------------------------------------------
+
+      - name: Prepare vcpkg baseline source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $configPath = "Meta/CMake/vcpkg-configuration.json"
+
+          if (-not (Test-Path $configPath)) {
+            throw "vcpkg-configuration.json not found."
+          }
+
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+
+          $baseline = $null
+
+          if ($config.'default-registry' -and
+              $config.'default-registry'.baseline) {
+            $baseline = $config.'default-registry'.baseline
+          }
+
+          if (-not $baseline -and $config.'builtin-baseline') {
+            $baseline = $config.'builtin-baseline'
+          }
+
+          if (-not $baseline) {
+            throw "Could not determine the vcpkg baseline from vcpkg-configuration.json."
+          }
+
+          Write-Host "Ladybird vcpkg baseline: $baseline"
+
+          $vcpkgRoot = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream"
+
+          git clone --filter=blob:none --no-checkout `
+            https://github.com/microsoft/vcpkg.git $vcpkgRoot
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to clone Microsoft vcpkg."
+          }
+
+          git -C $vcpkgRoot checkout $baseline
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to checkout vcpkg baseline $baseline."
+          }
+
+          $nghttp2Port = Join-Path $vcpkgRoot "ports/nghttp2/portfile.cmake"
+
+          if (-not (Test-Path $nghttp2Port)) {
+            throw "nghttp2 base port was not found in the checked-out vcpkg tree."
+          }
+
+          "VCPKG_BASELINE=$baseline" |
+            Out-File diagnostics/vcpkg-baseline.txt
+
+          "VCPKG_ROOT=$vcpkgRoot" |
+            Out-File diagnostics/vcpkg-baseline.txt -Append
+
+          Write-Host "nghttp2 base port found: $nghttp2Port"
 
       # --------------------------------------------------
-      # 6. Install vcpkg dependencies
+      # 7. Repair Ladybird nghttp2 overlay reference
+      # --------------------------------------------------
+
+      - name: Repair nghttp2 overlay path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $overlay = "Meta/CMake/vcpkg/overlay-ports/nghttp2/portfile.cmake"
+
+          if (-not (Test-Path $overlay)) {
+            throw "Ladybird nghttp2 overlay portfile was not found."
+          }
+
+          $vcpkgRoot = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream"
+          $basePort = Join-Path $vcpkgRoot "ports/nghttp2"
+
+          if (-not (Test-Path "$basePort/portfile.cmake")) {
+            throw "The replacement nghttp2 portfile does not exist."
+          }
+
+          $content = Get-Content $overlay -Raw
+
+          $content |
+            Out-File diagnostics/nghttp2-overlay-original.txt -Encoding utf8
+
+          $replacement = $basePort.Replace("\", "/")
+
+          $pattern = '(?m)(set\s*\(\s*CURRENT_PORT_DIR\s+")[^"]*VCPKG_ROOT_DIR[^"]*(/ports/nghttp2"\s*\))'
+
+          if ($content -notmatch $pattern) {
+            throw "The expected VCPKG_ROOT_DIR reference was not found. Overlay was not modified."
+          }
+
+          $updated = [regex]::Replace(
+            $content,
+            $pattern,
+            ('$1' + $replacement + '$2'),
+            1
+          )
+
+          Set-Content -Path $overlay -Value $updated -Encoding utf8
+
+          $check = Get-Content $overlay -Raw
+
+          if ($check -notmatch [regex]::Escape($replacement)) {
+            throw "nghttp2 overlay path replacement failed."
+          }
+
+          $check |
+            Out-File diagnostics/nghttp2-overlay-fixed.txt -Encoding utf8
+
+          Write-Host "nghttp2 overlay now references:"
+          Write-Host $basePort
+
+      # --------------------------------------------------
+      # 8. Install vcpkg dependencies
       # --------------------------------------------------
 
       - name: Install vcpkg dependencies
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           python Meta/ladybird.py vcpkg --preset Release
 
           if ($LASTEXITCODE -ne 0) {
+            $manifestLog = "Build/release/vcpkg-manifest-install.log"
+
+            if (Test-Path $manifestLog) {
+              Copy-Item $manifestLog diagnostics/vcpkg-manifest-install.log -Force
+            }
+
             throw "vcpkg dependency installation failed."
           }
 
       # --------------------------------------------------
-      # 7. Configure
+      # 9. Configure Release
       # --------------------------------------------------
 
       - name: Configure Release
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source
+
+          Write-Host "Using Ninja: $ninja"
+
           cmake --preset Release `
-            -DCMAKE_MAKE_PROGRAM="$(Get-Command ninja).Source" `
+            "-DCMAKE_MAKE_PROGRAM=$ninja" `
             -DLADYBIRD_BASELINE_CPU_TARGET=ON `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
           if ($LASTEXITCODE -ne 0) {
+            $manifestLog = "Build/release/vcpkg-manifest-install.log"
+
+            if (Test-Path $manifestLog) {
+              Copy-Item $manifestLog diagnostics/vcpkg-manifest-install.log -Force
+            }
+
             throw "CMake configuration failed."
           }
 
       # --------------------------------------------------
-      # 8. Verify actual CMake option
+      # 10. Verify CPU baseline option
       # --------------------------------------------------
 
       - name: Verify CPU baseline option
@@ -229,19 +380,14 @@ jobs:
           $cache = "Build/release/CMakeCache.txt"
 
           if (-not (Test-Path $cache)) {
-            throw "CMakeCache.txt not found."
+            throw "CMakeCache.txt was not generated."
           }
 
           Copy-Item $cache diagnostics/CMakeCache.txt -Force
 
           $content = Get-Content $cache -Raw
 
-          $enabled = [regex]::IsMatch(
-            $content,
-            '(?m)^LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON$'
-          )
-
-          if (-not $enabled) {
+          if ($content -notmatch '(?m)^LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON$') {
             Select-String -Path $cache `
               -Pattern "BASELINE_CPU|CMAKE_CXX_COMPILER|CMAKE_C_COMPILER" |
               Out-File diagnostics/cpu-baseline-cache.txt
@@ -253,11 +399,11 @@ jobs:
             Tee-Object diagnostics/cpu-baseline-status.txt
 
           Select-String -Path $cache `
-            -Pattern "BASELINE_CPU|CMAKE_CXX_COMPILER|CMAKE_C_COMPILER" |
+            -Pattern "BASELINE_CPU|CMAKE_CXX_COMPILER|CMAKE_C_COMPILER|CMAKE_SYSTEM_PROCESSOR" |
             Out-File diagnostics/cpu-baseline-cache.txt
 
       # --------------------------------------------------
-      # 9. Inspect compiler commands
+      # 11. Inspect compiler flags
       # --------------------------------------------------
 
       - name: Inspect compiler CPU flags
@@ -267,12 +413,14 @@ jobs:
           $commands = "Build/release/compile_commands.json"
 
           if (Test-Path $commands) {
+            Copy-Item $commands diagnostics/compile_commands.json -Force
+
             Select-String -Path $commands `
-              -Pattern "march=|target-cpu=|/arch:|x86-64-v2|avx2|avx512" |
+              -Pattern "march=x86-64-v2|target-cpu=x86-64-v2|avx2|avx512|/arch:" |
               Out-File diagnostics/compiler-cpu-flags.txt
 
             if ((Get-Item diagnostics/compiler-cpu-flags.txt).Length -eq 0) {
-              "No matching CPU flags found in compile_commands.json." |
+              "No matching CPU flags found." |
                 Out-File diagnostics/compiler-cpu-flags.txt
             }
           } else {
@@ -281,7 +429,7 @@ jobs:
           }
 
       # --------------------------------------------------
-      # 10. Build
+      # 12. Build
       # --------------------------------------------------
 
       - name: Build Ladybird
@@ -294,7 +442,7 @@ jobs:
           }
 
       # --------------------------------------------------
-      # 11. Install
+      # 13. Install
       # --------------------------------------------------
 
       - name: Install Ladybird
@@ -317,7 +465,7 @@ jobs:
             Export-Csv diagnostics/install-files.csv -NoTypeInformation
 
       # --------------------------------------------------
-      # 12. Package portable ZIP
+      # 14. Package
       # --------------------------------------------------
 
       - name: Package Windows ZIP
@@ -326,7 +474,7 @@ jobs:
           $sevenZip = "C:\Program Files\7-Zip\7z.exe"
 
           if (-not (Test-Path $sevenZip)) {
-            $command = Get-Command 7z -ErrorAction SilentlyContinue
+            $command = Get-Command 7z.exe -ErrorAction SilentlyContinue
 
             if (-not $command) {
               throw "7-Zip executable not found."
@@ -354,7 +502,7 @@ jobs:
           Get-Item $zip | Format-List FullName, Length
 
       # --------------------------------------------------
-      # 13. SHA256
+      # 15. SHA256
       # --------------------------------------------------
 
       - name: Generate SHA256
@@ -369,7 +517,7 @@ jobs:
           Get-Content "dist/$env:PACKAGE_NAME.sha256"
 
       # --------------------------------------------------
-      # 14. Upload ZIP
+      # 16. Upload build
       # --------------------------------------------------
 
       - name: Upload Windows ZIP
@@ -384,7 +532,7 @@ jobs:
           retention-days: 14
 
       # --------------------------------------------------
-      # 15. Upload diagnostics
+      # 17. Upload diagnostics
       # --------------------------------------------------
 
       - name: Upload diagnostic logs
@@ -397,7 +545,7 @@ jobs:
           retention-days: 14
 
       # --------------------------------------------------
-      # 16. GitHub Pre-release
+      # 18. Publish GitHub Pre-release
       # --------------------------------------------------
 
       - name: Publish GitHub Pre-release
