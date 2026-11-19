@@ -5,15 +5,23 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird source branch, tag or commit"
+        description: "Ladybird Git ref (branch, tag, or commit)"
         required: true
         default: "master"
         type: string
+
       publish_release:
-        description: "Publish GitHub prerelease"
+        description: "Publish a GitHub prerelease after a successful build"
         required: true
         default: false
         type: boolean
+
+  workflow:
+    push:
+      branches:
+        - main
+      paths:
+        - ".github/workflows/windows.yml"
 
 permissions:
   contents: write
@@ -24,889 +32,772 @@ concurrency:
 
 jobs:
   build:
-    name: Windows x64 Release
+    name: Build Ladybird Windows x64
     runs-on: windows-2025
     timeout-minutes: 360
 
+    defaults:
+      run:
+        shell: pwsh
+
     env:
-      VCPKG_FORCE_SYSTEM_BINARIES: 1
-      VCPKG_DISABLE_METRICS: 1
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      LLVM_VERSION: "22.1.8"
+      LLVM_ROOT: "C:\\LLVM-22.1.8"
+      VCPKG_ROOT: "${{ github.workspace }}\\ladybird\\.vcpkg-upstream"
+      BUILD_DIR: "Build/release"
 
     steps:
+      # ---------------------------------------------------------
+      # 1. Checkout workflow repository
+      # ---------------------------------------------------------
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
 
-      # ============================================================
-      # 1. Checkout Ladybird source
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 2. Checkout Ladybird source
+      # ---------------------------------------------------------
       - name: Checkout Ladybird
         uses: actions/checkout@v4
         with:
           repository: LadybirdBrowser/ladybird
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || 'master' }}
           path: ladybird
           fetch-depth: 1
           submodules: recursive
 
-      - name: Record source revision
-        id: source
-        working-directory: ladybird
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $commit = git rev-parse HEAD
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to read Ladybird commit."
-          }
-
-          $commit = $commit.Trim()
-
-          "commit=$commit" >> $env:GITHUB_OUTPUT
-
-          Write-Host "Ladybird commit: $commit"
-
-          $global:LASTEXITCODE = 0
-
-      # ============================================================
-      # 2. Python
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 3. Python
+      # ---------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
 
-      # ============================================================
-      # 3. Rust
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 4. Rust
+      # ---------------------------------------------------------
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      # ============================================================
-      # 4. Install official LLVM 22.1.8
-      # ============================================================
-
-      - name: Install LLVM 22.1.8
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $version = "22.1.8"
-          $installDir = "C:\LLVM-$version"
-
-          $installer = Join-Path `
-            $env:RUNNER_TEMP `
-            "LLVM-$version-win64.exe"
-
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
-
-          Write-Host "Downloading official LLVM $version"
-          Write-Host $url
-
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $installer
-
-          if (!(Test-Path $installer)) {
-            throw "LLVM installer download failed."
-          }
-
-          $size = (Get-Item $installer).Length
-
-          if ($size -lt 100000000) {
-            throw "LLVM installer is unexpectedly small: $size bytes"
-          }
-
-          Write-Host "Installing LLVM to $installDir"
-
-          $process = Start-Process `
-            -FilePath $installer `
-            -ArgumentList @(
-              "/S",
-              "/D=$installDir"
-            ) `
-            -Wait `
-            -PassThru
-
-          if ($process.ExitCode -ne 0) {
-            throw "LLVM installation failed: $($process.ExitCode)"
-          }
-
-          $clang = Join-Path $installDir "bin\clang-cl.exe"
-          $clangxx = Join-Path $installDir "bin\clang++.exe"
-          $lld = Join-Path $installDir "bin\lld-link.exe"
-
-          if (!(Test-Path $clang)) {
-            throw "LLVM clang-cl.exe not found."
-          }
-
-          if (!(Test-Path $clangxx)) {
-            throw "LLVM clang++.exe not found."
-          }
-
-          if (!(Test-Path $lld)) {
-            throw "LLVM lld-link.exe not found."
-          }
-
-          "$installDir\bin" >> $env:GITHUB_PATH
-
-          "LADYBIRD_LLVM_ROOT=$installDir" >> $env:GITHUB_ENV
-
-          Write-Host "===== Installed Clang ====="
-
-          & $clang --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Clang version check failed."
-          }
-
-          Write-Host "===== Installed LLD ====="
-
-          & $lld --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "LLD version check failed."
-          }
-
-          $global:LASTEXITCODE = 0
-
-      # ============================================================
+      # ---------------------------------------------------------
       # 5. Initialize MSVC x64 environment
-      # ============================================================
-
-      - name: Initialize MSVC x64 environment
+      # ---------------------------------------------------------
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ============================================================
-      # 6. Install Windows build prerequisites
-      # ============================================================
-
-      - name: Install NASM and pkg-config
-        shell: pwsh
+      # ---------------------------------------------------------
+      # 6. Install LLVM / Clang 22.1.8
+      # ---------------------------------------------------------
+      - name: Install LLVM 22.1.8
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (!(Get-Command nasm -ErrorAction SilentlyContinue)) {
+          $llvmRoot = "C:\LLVM-22.1.8"
+          $clang = Join-Path $llvmRoot "bin\clang-cl.exe"
+
+          if (-not (Test-Path $clang)) {
+            $installer = Join-Path $env:RUNNER_TEMP "LLVM-22.1.8-win64.exe"
+
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe"
+
+            Write-Host "Downloading LLVM 22.1.8..."
+
+            Invoke-WebRequest `
+              -Uri $url `
+              -OutFile $installer `
+              -UseBasicParsing
+
+            Write-Host "Installing LLVM..."
+
+            $process = Start-Process `
+              -FilePath $installer `
+              -ArgumentList @("/S", "/D=$llvmRoot") `
+              -Wait `
+              -PassThru
+
+            if ($process.ExitCode -ne 0) {
+              throw "LLVM installer failed: $($process.ExitCode)"
+            }
+          }
+
+          if (-not (Test-Path $clang)) {
+            throw "clang-cl.exe was not installed."
+          }
+
+          $clangVersion = & $clang --version
+          $clangVersion | Write-Host
+
+          if (($clangVersion -join "`n") -notmatch "22\.1\.8") {
+            throw "Unexpected Clang version."
+          }
+
+          "C:\LLVM-22.1.8\bin" | Out-File `
+            -FilePath $env:GITHUB_PATH `
+            -Append `
+            -Encoding utf8
+
+          Write-Host "LLVM 22.1.8 installation verified."
+
+      # ---------------------------------------------------------
+      # 7. Install build tools
+      # ---------------------------------------------------------
+      - name: Install build tools
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+
+          if (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue)) {
             choco install nasm -y --no-progress
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "NASM installation failed."
-            }
           }
 
-          if (!(Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+          if (-not (Get-Command pkgconfiglite -ErrorAction SilentlyContinue)) {
             choco install pkgconfiglite -y --no-progress
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "pkgconfiglite installation failed."
-            }
           }
 
-          Write-Host "NASM:"
-          nasm -v
+          $ninjaPath = (Get-Command ninja.exe -ErrorAction Stop).Source
 
-          Write-Host "CMake:"
-          cmake --version
+          Write-Host "Ninja: $ninjaPath"
 
-          Write-Host "Ninja:"
-          ninja --version
+          & $ninjaPath --version
 
-          Write-Host "Python:"
-          python --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ninja verification failed."
+          }
 
-          Write-Host "Rust:"
-          rustc --version
+          nasm.exe -v
 
-          Write-Host "Cargo:"
-          cargo --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "NASM verification failed."
+          }
 
-          Write-Host "Clang:"
-          clang-cl --version
-
-          $global:LASTEXITCODE = 0
-
-      # ============================================================
-      # 7. Verify actual compiler selection
-      # ============================================================
-
-      - name: Verify LLVM and MSVC environment
-        shell: pwsh
+      # ---------------------------------------------------------
+      # 8. Verify compiler and toolchain
+      # ---------------------------------------------------------
+      - name: Verify toolchain
         run: |
           $ErrorActionPreference = "Stop"
 
-          $expected = Join-Path `
-            $env:LADYBIRD_LLVM_ROOT `
-            "bin\clang-cl.exe"
+          $clang = "C:\LLVM-22.1.8\bin\clang-cl.exe"
+          $clangxx = "C:\LLVM-22.1.8\bin\clang++.exe"
+          $lld = "C:\LLVM-22.1.8\bin\lld-link.exe"
 
-          $actual = (Get-Command clang-cl.exe -ErrorAction Stop).Source
-
-          Write-Host "Expected compiler: $expected"
-          Write-Host "Actual compiler:   $actual"
-
-          if ($actual -ne $expected) {
-            throw "Wrong clang-cl selected."
+          foreach ($file in @($clang, $clangxx, $lld)) {
+            if (-not (Test-Path $file)) {
+              throw "Missing LLVM tool: $file"
+            }
           }
 
-          $version = & $expected --version | Out-String
+          & $clang --version
 
-          Write-Host $version
-
-          if ($version -notmatch "clang version 22\.") {
-            throw "Expected LLVM 22.x."
+          if ($LASTEXITCODE -ne 0) {
+            throw "Clang verification failed."
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
-            throw "MSVC environment was not initialized."
+          Write-Host "MSVC environment:"
+          Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
+          Write-Host "WindowsSdkDir=$env:WindowsSdkDir"
+
+          if (-not $env:VCToolsInstallDir) {
+            throw "MSVC environment is not initialized."
           }
 
-          Write-Host "MSVC tools: $env:VCToolsInstallDir"
-          Write-Host "Windows SDK: $env:WindowsSdkDir"
-
-          if (!(Test-Path $env:VCToolsInstallDir)) {
-            throw "MSVC toolchain directory not found."
+          if (-not $env:WindowsSdkDir) {
+            throw "Windows SDK is not available."
           }
 
-          $global:LASTEXITCODE = 0
+          Write-Host "Toolchain verification passed."
 
-      # ============================================================
-      # 8. Read exact vcpkg baseline from source manifest
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 9. Read vcpkg baseline from Ladybird manifest
+      # ---------------------------------------------------------
       - name: Read vcpkg baseline
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $manifestPath = Join-Path $PWD "vcpkg.json"
-
-          if (!(Test-Path $manifestPath)) {
-            throw "vcpkg.json not found."
-          }
-
-          $manifest = Get-Content $manifestPath -Raw |
+          $manifest = Get-Content "vcpkg.json" -Raw |
             ConvertFrom-Json
 
           $baseline = $manifest.'builtin-baseline'
 
-          if ($baseline -notmatch '^[0-9a-fA-F]{40}$') {
-            throw "Invalid vcpkg builtin-baseline: $baseline"
+          if (-not $baseline) {
+            throw "Could not read builtin-baseline from vcpkg.json."
           }
 
-          Write-Host "Source manifest baseline: $baseline"
+          Write-Host "Ladybird vcpkg baseline: $baseline"
 
-          "VCPKG_BASELINE=$baseline" >> $env:GITHUB_ENV
+          "VCPKG_BASELINE=$baseline" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append `
+            -Encoding utf8
 
-          # Save exact manifest for diagnostics.
+          $baseline | Out-File `
+            -FilePath "$env:RUNNER_TEMP\vcpkg-baseline.txt" `
+            -Encoding utf8
 
-          Copy-Item `
-            $manifestPath `
-            "$env:RUNNER_TEMP\ladybird-vcpkg.json" `
-            -Force
-
-      # ============================================================
-      # 9. Full vcpkg repository
-      # ============================================================
-
-      - name: Checkout complete vcpkg baseline
+      # ---------------------------------------------------------
+      # 10. Full clone vcpkg at exact baseline
+      # ---------------------------------------------------------
+      - name: Clone vcpkg
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $root = Join-Path $PWD ".vcpkg-upstream"
+          $vcpkgRoot = Join-Path $PWD ".vcpkg-upstream"
 
-          if (Test-Path $root) {
-            Remove-Item $root -Recurse -Force
+          if (Test-Path $vcpkgRoot) {
+            Remove-Item $vcpkgRoot -Recurse -Force
           }
-
-          git config --global http.retry 5
-          git config --global http.lowSpeedLimit 1000
-          git config --global http.lowSpeedTime 60
 
           $success = $false
 
           for ($attempt = 1; $attempt -le 3; $attempt++) {
-
             Write-Host "Full vcpkg clone attempt $attempt / 3"
 
-            if (Test-Path $root) {
-              Remove-Item $root -Recurse -Force
+            if (Test-Path $vcpkgRoot) {
+              Remove-Item $vcpkgRoot -Recurse -Force
             }
 
-            git clone --no-checkout `
-              https://github.com/microsoft/vcpkg.git `
-              $root
+            git clone https://github.com/microsoft/vcpkg.git $vcpkgRoot
 
-            $cloneExit = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-
-            if ($cloneExit -eq 0) {
+            if ($LASTEXITCODE -eq 0) {
               $success = $true
               break
             }
 
-            Write-Warning "Clone failed: $cloneExit"
+            Write-Warning "vcpkg clone failed."
 
-            Start-Sleep -Seconds (20 * $attempt)
+            Start-Sleep -Seconds (10 * $attempt)
           }
 
-          if (!$success) {
-            Resolve-DnsName github.com -ErrorAction Continue
-
-            Test-NetConnection github.com `
-              -Port 443 `
-              -WarningAction Continue
-
-            throw "Unable to clone complete vcpkg repository."
+          if (-not $success) {
+            throw "Could not clone vcpkg after 3 attempts."
           }
 
-          git -C $root checkout --detach $env:VCPKG_BASELINE
+          Set-Location $vcpkgRoot
 
-          $checkoutExit = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
+          git checkout $env:VCPKG_BASELINE
 
-          if ($checkoutExit -ne 0) {
-            throw "Unable to checkout vcpkg baseline."
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not checkout vcpkg baseline."
           }
 
-          $actual = git -C $root rev-parse HEAD
+          $actualCommit = (git rev-parse HEAD).Trim()
 
-          $revExit = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($revExit -ne 0) {
-            throw "Unable to read vcpkg commit."
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read vcpkg commit."
           }
 
-          $actual = $actual.Trim()
+          Write-Host "vcpkg root: $vcpkgRoot"
+          Write-Host "vcpkg commit: $actualCommit"
+          Write-Host "Expected baseline: $env:VCPKG_BASELINE"
 
-          if ($actual -ne $env:VCPKG_BASELINE) {
-            throw "vcpkg baseline mismatch."
+          if ($actualCommit -ne $env:VCPKG_BASELINE) {
+            throw "vcpkg commit does not match Ladybird baseline."
           }
 
-          $promisor = git -C $root config --get remote.origin.promisor
+          # Verify this is not a partial/promisor clone.
+          $config = Get-Content ".git\config" -Raw
 
-          $promisorExit = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($promisorExit -gt 1) {
-            throw "Unable to inspect promisor configuration."
+          if ($config -match '(?im)^\s*promisor\s*=\s*true\s*$') {
+            throw "vcpkg is a promisor clone. Full clone required."
           }
 
-          if ($promisor -eq "true") {
-            throw "Partial clone detected."
-          }
+          Write-Host "Full vcpkg clone verified."
 
-          $toolchain = Join-Path `
-            $root `
-            "scripts/buildsystems/vcpkg.cmake"
-
-          if (!(Test-Path $toolchain)) {
-            throw "vcpkg toolchain missing."
-          }
-
-          foreach ($port in @(
-            "curl",
-            "nghttp2",
-            "freetype",
-            "harfbuzz",
-            "libpng",
-            "openssl",
-            "qtbase",
-            "skia",
-            "angle"
-          )) {
-
-            $portfile = Join-Path `
-              $root `
-              "ports/$port/portfile.cmake"
-
-            if (!(Test-Path $portfile)) {
-              throw "Missing vcpkg port: $port"
-            }
-
-            Write-Host "Verified vcpkg port: $port"
-          }
-
-          "LADYBIRD_VCPKG_ROOT=$root" >> $env:GITHUB_ENV
-
-          Write-Host "vcpkg commit: $actual"
-          Write-Host "vcpkg root: $root"
-          Write-Host "Promisor: false"
-
-          $global:LASTEXITCODE = 0
-
-      # ============================================================
-      # 10. Verify Ladybird overlays
-      # ============================================================
-
-      - name: Verify Ladybird vcpkg overlays
-        working-directory: ladybird
-        shell: pwsh
+      # ---------------------------------------------------------
+      # 11. Bootstrap vcpkg
+      # ---------------------------------------------------------
+      - name: Bootstrap vcpkg
+        working-directory: ladybird/.vcpkg-upstream
         run: |
           $ErrorActionPreference = "Stop"
 
-          $overlay = Join-Path `
-            $PWD `
-            "Meta/CMake/vcpkg/overlay-ports"
+          .\bootstrap-vcpkg.bat -disableMetrics
 
-          $triplets = Join-Path `
-            $PWD `
-            "Meta/CMake/vcpkg/release-triplets"
-
-          if (!(Test-Path $overlay)) {
-            throw "Overlay ports directory missing."
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg bootstrap failed."
           }
 
-          if (!(Test-Path $triplets)) {
-            throw "Release triplets directory missing."
+          if (-not (Test-Path ".\vcpkg.exe")) {
+            throw "vcpkg.exe was not generated."
           }
 
-          foreach ($port in @("curl", "nghttp2")) {
+          .\vcpkg.exe version
 
-            $file = Join-Path `
-              $overlay `
-              "$port/portfile.cmake"
-
-            if (!(Test-Path $file)) {
-              throw "Overlay port missing: $port"
-            }
-
-            Write-Host "Verified overlay: $file"
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg version check failed."
           }
 
-          $triplet = Join-Path `
-            $triplets `
-            "x64-windows.cmake"
-
-          if (!(Test-Path $triplet)) {
-            throw "x64-windows overlay triplet missing."
-          }
-
-          Write-Host "Overlay and triplet verified."
-
-      # ============================================================
-      # 11. Clean previous CMake build cache
-      # ============================================================
-
-      - name: Clean previous build directory
+      # ---------------------------------------------------------
+      # 12. Verify Ladybird overlays and vcpkg ports
+      # ---------------------------------------------------------
+      - name: Verify vcpkg overlays
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $build = Join-Path $PWD "Build/release"
+          $ports = Join-Path $PWD "Meta\CMake\vcpkg\overlay-ports"
+          $triplets = Join-Path $PWD "Meta\CMake\vcpkg\release-triplets"
+          $triplet = Join-Path $triplets "x64-windows.cmake"
+
+          $basePorts = Join-Path `
+            $PWD `
+            ".vcpkg-upstream\ports"
+
+          foreach ($path in @($ports, $triplets, $triplet, $basePorts)) {
+            if (-not (Test-Path $path)) {
+              throw "Required vcpkg path is missing: $path"
+            }
+          }
+
+          Write-Host "Overlay ports: $ports"
+          Write-Host "Overlay triplets: $triplets"
+          Write-Host "Base ports: $basePorts"
+
+      # ---------------------------------------------------------
+      # 13. Clean previous build directory
+      # ---------------------------------------------------------
+      - name: Prepare build directory
+        working-directory: ladybird
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $build = "Build/release"
 
           if (Test-Path $build) {
             Remove-Item $build -Recurse -Force
           }
 
-          if (Test-Path $build) {
-            throw "Unable to clean previous CMake build."
-          }
+          New-Item -ItemType Directory -Force -Path $build |
+            Out-Null
 
-          Write-Host "Previous CMake cache removed."
-
-      # ============================================================
-      # 12. Configure Ladybird with explicit Clang 22
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 14. Configure Ladybird
+      # ---------------------------------------------------------
       - name: Configure Ladybird
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $llvmBin = Join-Path `
-            $env:LADYBIRD_LLVM_ROOT `
-            "bin"
+          $ninjaPath = (Get-Command ninja.exe -ErrorAction Stop).Source
 
-          $clang = Join-Path $llvmBin "clang-cl.exe"
+          $vcpkgToolchain = Join-Path `
+            $PWD `
+            ".vcpkg-upstream\scripts\buildsystems\vcpkg.cmake"
 
-          $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source
+          $overlayPorts = Join-Path `
+            $PWD `
+            "Meta\CMake\vcpkg\overlay-ports"
 
-          $root = $env:LADYBIRD_VCPKG_ROOT
+          $overlayTriplets = Join-Path `
+            $PWD `
+            "Meta\CMake\vcpkg\release-triplets"
 
-          $toolchain = Join-Path `
-            $root `
-            "scripts/buildsystems/vcpkg.cmake"
+          $clang = "C:/LLVM-22.1.8/bin/clang-cl.exe"
 
-          $overlay = (
-            Join-Path $PWD "Meta/CMake/vcpkg/overlay-ports"
-          ).Replace("\", "/")
-
-          $triplets = (
-            Join-Path $PWD "Meta/CMake/vcpkg/release-triplets"
-          ).Replace("\", "/")
-
-          $env:PATH = "$llvmBin;$env:PATH"
-          $env:VCPKG_ROOT = $root
-
-          if (!(Test-Path $clang)) {
-            throw "Clang compiler missing."
-          }
-
-          Write-Host "Compiler: $clang"
-          Write-Host "Ninja: $ninja"
-          Write-Host "vcpkg: $root"
-
-          & $clang --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Clang failed."
-          }
-
-          cmake --preset Release `
-            "-DCMAKE_C_COMPILER=$clang" `
-            "-DCMAKE_CXX_COMPILER=$clang" `
-            "-DCMAKE_MAKE_PROGRAM=$ninja" `
-            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
-            "-DVCPKG_ROOT=$root" `
-            "-DVCPKG_ROOT_DIR=$root" `
-            "-DVCPKG_OVERLAY_PORTS=$overlay" `
-            "-DVCPKG_OVERLAY_TRIPLETS=$triplets" `
-            "-DVCPKG_TARGET_TRIPLET=x64-windows" `
-            "-DLADYBIRD_BASELINE_CPU_TARGET=ON" `
+          $arguments = @(
+            "--preset", "Release",
+            "-DCMAKE_C_COMPILER=$clang",
+            "-DCMAKE_CXX_COMPILER=$clang",
+            "-DCMAKE_MAKE_PROGRAM=$ninjaPath",
+            "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain",
+            "-DVCPKG_OVERLAY_PORTS=$overlayPorts",
+            "-DVCPKG_OVERLAY_TRIPLETS=$overlayTriplets",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows",
+            "-DLADYBIRD_BASELINE_CPU_TARGET=ON",
+            "-DLADYBIRD_VCPKG_TYPE=release",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+          )
 
-          $configureExit = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
+          Write-Host "Configuring Ladybird..."
+          Write-Host "Compiler: $clang"
+          Write-Host "Ninja: $ninjaPath"
+          Write-Host "vcpkg: $vcpkgToolchain"
 
-          if ($configureExit -ne 0) {
-            throw "CMake configure failed: $configureExit"
+          & cmake @arguments 2>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\cmake-configure.log"
+
+          $configureExitCode = $LASTEXITCODE
+
+          if ($configureExitCode -ne 0) {
+            throw "CMake configure failed: $configureExitCode"
           }
+
+          Write-Host "CMake configure completed."
+
+      # ---------------------------------------------------------
+      # 15. Verify CMake selected the correct compiler
+      # ---------------------------------------------------------
+      - name: Verify CMake compiler
+        working-directory: ladybird
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $cachePath = "Build/release/CMakeCache.txt"
 
-          if (!(Test-Path $cachePath)) {
-            throw "CMakeCache.txt missing."
+          if (-not (Test-Path $cachePath)) {
+            throw "CMakeCache.txt was not generated."
           }
 
           $cache = Get-Content $cachePath -Raw
 
-          if ($cache -notmatch [regex]::Escape($clang)) {
-            throw "CMake did not select the requested Clang compiler."
+          # CMake may write Windows paths with either slash style.
+          $expectedCompiler = "C:/LLVM-22.1.8/bin/clang-cl.exe"
+
+          $compilerMatches = [regex]::Matches(
+            $cache,
+            '(?m)^CMAKE_(?:C|CXX)_COMPILER:[^=]*=(.+)$'
+          )
+
+          if ($compilerMatches.Count -lt 2) {
+            throw "CMake compiler entries were not found."
           }
 
-          if ($cache -notmatch "LADYBIRD_BASELINE_CPU_TARGET:.*=ON") {
-            throw "CPU baseline is not enabled."
+          foreach ($match in $compilerMatches) {
+            $actualCompiler = $match.Groups[1].Value.Trim().Replace('\', '/')
+
+            Write-Host "Detected compiler: $actualCompiler"
+
+            if (-not $actualCompiler.Equals(
+              $expectedCompiler,
+              [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+              throw "Unexpected compiler: $actualCompiler"
+            }
           }
 
-          if ($cache -notmatch [regex]::Escape($root)) {
-            throw "CMake is not using local vcpkg."
+          if ($cache -notmatch '(?m)^LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON$' -and
+              $cache -notmatch '(?m)^LADYBIRD_BASELINE_CPU_TARGET:UNINITIALIZED=ON$') {
+            throw "CPU baseline option is not enabled in CMakeCache."
           }
 
-          if ($cache -match "Program Files/Microsoft Visual Studio/.*/vcpkg") {
-            throw "Visual Studio bundled vcpkg detected."
-          }
+          Write-Host "Clang compiler verification passed."
+          Write-Host "CPU baseline option verification passed."
 
-          Write-Host "CMake compiler and vcpkg configuration verified."
-
-      # ============================================================
-      # 13. Verify exact compiler cache
-      # ============================================================
-
-      - name: Verify CMake compiler and dependencies
+      # ---------------------------------------------------------
+      # 16. Verify x86-64-v2 compile flags
+      # ---------------------------------------------------------
+      - name: Verify CPU baseline compile flags
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $cache = Get-Content `
-            "Build/release/CMakeCache.txt" `
-            -Raw
+          $compileCommands = "Build/release/compile_commands.json"
 
-          Write-Host "===== Compiler cache ====="
-
-          Select-String `
-            -Path "Build/release/CMakeCache.txt" `
-            -Pattern "CMAKE_C_COMPILER:|CMAKE_CXX_COMPILER:|CMAKE_MAKE_PROGRAM:|CMAKE_TOOLCHAIN_FILE:|VCPKG_TARGET_TRIPLET:|LADYBIRD_BASELINE_CPU_TARGET:"
-
-          Write-Host "===== vcpkg manifest ====="
-
-          Get-Content "vcpkg.json" -TotalCount 30
-
-          $installed = Join-Path `
-            $PWD `
-            "Build/release/vcpkg_installed/x64-windows"
-
-          if (!(Test-Path $installed)) {
-            throw "vcpkg x64-windows installation directory missing."
+          if (-not (Test-Path $compileCommands)) {
+            throw "compile_commands.json was not generated."
           }
 
-          Write-Host "vcpkg installation directory exists."
+          $commands = Get-Content $compileCommands -Raw |
+            ConvertFrom-Json
 
-      # ============================================================
-      # 14. Build Ladybird
-      # ============================================================
+          $total = 0
+          $missing = @()
 
+          foreach ($entry in $commands) {
+            $commandText = ""
+
+            if ($entry.command) {
+              $commandText = $entry.command
+            }
+            elseif ($entry.arguments) {
+              $commandText = $entry.arguments -join " "
+            }
+
+            if ($commandText -match 'clang-cl|clang\+\+') {
+              $total++
+
+              if ($commandText -notmatch '-march=x86-64-v2') {
+                $missing += $entry.file
+              }
+            }
+          }
+
+          Write-Host "Compiler commands checked: $total"
+          Write-Host "Commands missing x86-64-v2: $($missing.Count)"
+
+          if ($total -eq 0) {
+            throw "No Clang compile commands found."
+          }
+
+          if ($missing.Count -gt 0) {
+            $missing | Select-Object -First 30 | ForEach-Object {
+              Write-Host "Missing baseline: $_"
+            }
+
+            throw "Some compiler commands do not contain x86-64-v2."
+          }
+
+          Write-Host "All checked Clang commands use x86-64-v2."
+
+      # ---------------------------------------------------------
+      # 17. Build Ladybird
+      # ---------------------------------------------------------
       - name: Build Ladybird
         working-directory: ladybird
-        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
-          Write-Host "Starting Ladybird Release build."
+          $log = "Build/release-build.log"
 
-          cmake --build Build/release --parallel 4
+          Write-Host "Starting Ladybird build..."
+          Write-Host "Build directory: Build/release"
 
-          $buildExit = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
+          # Use cmd redirection so the native process exit code
+          # is preserved independently of PowerShell's pipeline.
+          cmd.exe /d /s /c `
+            "cmake --build Build/release --parallel 4 > Build\release-build.log 2>&1"
 
-          if ($buildExit -ne 0) {
-            throw "Ladybird build failed: $buildExit"
+          $buildExitCode = $LASTEXITCODE
+
+          Write-Host "Build exit code: $buildExitCode"
+
+          if (Test-Path $log) {
+            Write-Host "===== BUILD LOG TAIL ====="
+            Get-Content $log -Tail 300
+          }
+
+          "LADYBIRD_BUILD_EXIT_CODE=$buildExitCode" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          if ($buildExitCode -ne 0) {
+            throw "Ladybird build failed with exit code $buildExitCode."
           }
 
           Write-Host "Ladybird build completed."
 
-      # ============================================================
-      # 15. Package build output
-      # ============================================================
+      # ---------------------------------------------------------
+      # 18. Locate generated executables
+      # ---------------------------------------------------------
+      - name: Inspect build outputs
+        if: always()
+        working-directory: ladybird
+        run: |
+          $ErrorActionPreference = "Continue"
 
-      - name: Package Windows build
+          $build = "Build/release"
+
+          if (Test-Path $build) {
+            Write-Host "===== Generated EXE files ====="
+
+            Get-ChildItem $build -Recurse -File -Filter "*.exe" |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
+
+            Write-Host "===== Generated DLL files ====="
+
+            Get-ChildItem $build -Recurse -File -Filter "*.dll" |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
+          }
+
+      # ---------------------------------------------------------
+      # 19. Verify browser executable exists
+      # ---------------------------------------------------------
+      - name: Verify browser executable
         if: success()
         working-directory: ladybird
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $build = Join-Path $PWD "Build/release"
+          $executables = Get-ChildItem `
+            "Build/release" `
+            -Recurse `
+            -File `
+            -Filter "*.exe"
 
-          if (!(Test-Path $build)) {
-            throw "Build output directory missing."
+          if (-not $executables) {
+            throw "No EXE files were generated."
           }
 
-          $executables = @(
-            Get-ChildItem `
-              $build `
-              -Recurse `
-              -Filter "*.exe" `
-              -File
-          )
-
-          if ($executables.Count -eq 0) {
-            throw "No Windows executable found."
-          }
-
-          Write-Host "Found executables:"
-
+          Write-Host "Generated executable files:"
           $executables | ForEach-Object {
-            Write-Host $_.FullName
+            Write-Host "$($_.FullName) ($($_.Length) bytes)"
           }
 
-          $stage = Join-Path `
-            $PWD `
-            "Ladybird-Windows-x64"
-
-          $zip = Join-Path `
-            $PWD `
-            "Ladybird-Windows-x64.zip"
-
-          $shaFile = Join-Path `
-            $PWD `
-            "Ladybird-Windows-x64.zip.sha256"
-
-          if (Test-Path $stage) {
-            Remove-Item $stage -Recurse -Force
+          $browserCandidates = $executables | Where-Object {
+            $_.Name -match '^(Ladybird|Browser|WebContent|WebWorker).*\.exe$'
           }
 
-          if (Test-Path $zip) {
-            Remove-Item $zip -Force
+          if (-not $browserCandidates) {
+            Write-Warning "No obvious browser executable name was found. Inspect the output list."
           }
 
-          if (Test-Path $shaFile) {
-            Remove-Item $shaFile -Force
+      # ---------------------------------------------------------
+      # 20. Package build directory
+      # ---------------------------------------------------------
+      - name: Package Windows x64 build
+        if: success()
+        working-directory: ladybird
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = "Build/release"
+
+          if (-not (Test-Path $source)) {
+            throw "Build directory does not exist."
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Path $stage |
+          $packageRoot = Join-Path $PWD "package"
+          $packageDir = Join-Path $packageRoot "Ladybird-Windows-x64"
+
+          if (Test-Path $packageRoot) {
+            Remove-Item $packageRoot -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $packageDir |
             Out-Null
 
-          Copy-Item `
-            "$build\*" `
-            $stage `
-            -Recurse `
-            -Force
+          Copy-Item "$source\*" $packageDir -Recurse -Force
+
+          $commit = (git rev-parse HEAD).Trim()
+
+          @"
+          Ladybird Windows x64 build
+
+          Upstream: https://github.com/LadybirdBrowser/ladybird
+          Commit: $commit
+          Compiler: LLVM/Clang 22.1.8
+          Architecture: x86_64
+          CPU baseline: x86-64-v2
+          Configuration: Release preset
+
+          Note:
+          This archive contains the CMake build directory.
+          It has not yet been verified as a portable distribution
+          on a clean Windows machine.
+          "@ | Out-File `
+            -FilePath (Join-Path $packageDir "BUILD-INFO.txt") `
+            -Encoding utf8
+
+          $zip = Join-Path $packageRoot "Ladybird-Windows-x64.zip"
 
           Compress-Archive `
-            -Path "$stage\*" `
+            -Path "$packageDir\*" `
             -DestinationPath $zip `
             -CompressionLevel Optimal
 
-          if (!(Test-Path $zip)) {
-            throw "ZIP creation failed."
-          }
-
-          $hash = (
-            Get-FileHash $zip -Algorithm SHA256
-          ).Hash.ToLower()
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 
           "$hash  Ladybird-Windows-x64.zip" |
-            Set-Content $shaFile
+            Out-File `
+              -FilePath (Join-Path $packageRoot "SHA256SUMS.txt") `
+              -Encoding ascii
 
-          Write-Host "Package: $zip"
+          Write-Host "ZIP: $zip"
           Write-Host "SHA256: $hash"
 
-      # ============================================================
-      # 16. Upload build artifacts
-      # ============================================================
-
-      - name: Upload Windows build
+      # ---------------------------------------------------------
+      # 21. Upload build artifact
+      # ---------------------------------------------------------
+      - name: Upload Windows x64 artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Ladybird-Windows-x64
           path: |
-            ladybird/Ladybird-Windows-x64.zip
-            ladybird/Ladybird-Windows-x64.zip.sha256
+            ladybird/package/Ladybird-Windows-x64.zip
+            ladybird/package/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
-      # ============================================================
-      # 17. Collect diagnostics
-      # ============================================================
-
+      # ---------------------------------------------------------
+      # 22. Collect diagnostics
+      # ---------------------------------------------------------
       - name: Collect diagnostics
         if: always()
-        shell: pwsh
+        working-directory: ladybird
         run: |
           $ErrorActionPreference = "Continue"
 
-          $out = Join-Path $PWD "diagnostics"
+          $diagnostics = Join-Path $PWD "diagnostics"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $out |
+          New-Item -ItemType Directory -Force -Path $diagnostics |
             Out-Null
 
           $files = @(
-            "ladybird/vcpkg.json",
-            "ladybird/Build/release/CMakeCache.txt",
-            "ladybird/Build/release/compile_commands.json",
-            "ladybird/Build/release/vcpkg-manifest-install.log",
-            "ladybird/Build/release/vcpkg_installed/vcpkg/status"
+            "Build/release/CMakeCache.txt",
+            "Build/release/compile_commands.json",
+            "Build/release/build.ninja",
+            "Build/release-build.log",
+            "vcpkg.json",
+            ".vcpkg-upstream/vcpkg.json",
+            ".vcpkg-upstream/versions/baseline.json"
           )
 
           foreach ($file in $files) {
             if (Test-Path $file) {
-              Copy-Item $file $out -Force
+              $destination = Join-Path $diagnostics `
+                ([IO.Path]::GetFileName($file))
+
+              Copy-Item $file $destination -Force
             }
           }
 
-          if (Test-Path "ladybird/Build/release") {
-            Get-ChildItem `
-              "ladybird/Build/release" `
-              -Recurse `
-              -File |
-              Where-Object {
-                $_.Name -match "CMakeError|CMakeOutput|\.log$"
-              } |
-              Select-Object -First 100 |
-              ForEach-Object {
-                Copy-Item `
-                  $_.FullName `
-                  (Join-Path $out $_.Name) `
-                  -Force
-              }
+          if (Test-Path ".vcpkg-upstream") {
+            git -C ".vcpkg-upstream" rev-parse HEAD |
+              Out-File "$diagnostics\vcpkg-commit.txt" -Encoding utf8
           }
 
-          if (Test-Path "ladybird") {
-            git -C ladybird rev-parse HEAD |
-              Set-Content "$out/ladybird-commit.txt"
+          git rev-parse HEAD |
+            Out-File "$diagnostics\ladybird-commit.txt" -Encoding utf8
 
-            $global:LASTEXITCODE = 0
+          git status --short |
+            Out-File "$diagnostics\ladybird-status.txt" -Encoding utf8
+
+          if (Test-Path "$env:RUNNER_TEMP\cmake-configure.log") {
+            Copy-Item `
+              "$env:RUNNER_TEMP\cmake-configure.log" `
+              "$diagnostics\cmake-configure.log" `
+              -Force
           }
 
-          if ($env:LADYBIRD_VCPKG_ROOT -and
-              (Test-Path "$env:LADYBIRD_VCPKG_ROOT/.git")) {
-
-            git -C $env:LADYBIRD_VCPKG_ROOT rev-parse HEAD |
-              Set-Content "$out/vcpkg-commit.txt"
-
-            $global:LASTEXITCODE = 0
-
-            $promisor = git -C $env:LADYBIRD_VCPKG_ROOT config --get remote.origin.promisor
-
-            "promisor=$promisor" |
-              Set-Content "$out/vcpkg-promisor.txt"
-
-            $global:LASTEXITCODE = 0
+          if (Test-Path "$env:RUNNER_TEMP\vcpkg-baseline.txt") {
+            Copy-Item `
+              "$env:RUNNER_TEMP\vcpkg-baseline.txt" `
+              "$diagnostics\vcpkg-baseline.txt" `
+              -Force
           }
 
-          if ($env:LADYBIRD_LLVM_ROOT) {
-            $clang = Join-Path `
-              $env:LADYBIRD_LLVM_ROOT `
-              "bin\clang-cl.exe"
+          Get-ChildItem $diagnostics -File |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
 
-            if (Test-Path $clang) {
-              & $clang --version |
-                Set-Content "$out/clang-version.txt"
-
-              $global:LASTEXITCODE = 0
-            }
-          }
-
-          if (Test-Path "ladybird/Build/release/CMakeCache.txt") {
-            Select-String `
-              -Path "ladybird/Build/release/CMakeCache.txt" `
-              -Pattern "CMAKE_C_COMPILER:|CMAKE_CXX_COMPILER:|CMAKE_TOOLCHAIN_FILE:|VCPKG_TARGET_TRIPLET:|LADYBIRD_BASELINE_CPU_TARGET:" |
-              Set-Content "$out/compiler-and-vcpkg-config.txt"
-          }
-
-      - name: Upload diagnostics
+      # ---------------------------------------------------------
+      # 23. Upload diagnostics even when build fails
+      # ---------------------------------------------------------
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Ladybird-Windows-diagnostics
-          path: diagnostics/
+          path: |
+            ladybird/diagnostics/**
           if-no-files-found: warn
+          compression-level: 6
           retention-days: 14
 
-      # ============================================================
-      # 18. Optional GitHub prerelease
-      # ============================================================
-
-      - name: Publish prerelease
-        if: success() && inputs.publish_release
+      # ---------------------------------------------------------
+      # 24. Publish optional GitHub prerelease
+      # ---------------------------------------------------------
+      - name: Publish GitHub prerelease
+        if: success() && inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ladybird-windows-${{ github.run_number }}
           name: Ladybird Windows x64 Build ${{ github.run_number }}
           prerelease: true
+          generate_release_notes: true
           files: |
-            ladybird/Ladybird-Windows-x64.zip
-            ladybird/Ladybird-Windows-x64.zip.sha256
-          body: |
-            Automated Ladybird Windows x64 build.
-
-            Source:
-            https://github.com/LadybirdBrowser/ladybird
-
-            Source ref: ${{ inputs.ref }}
-            Source commit: ${{ steps.source.outputs.commit }}
-
-            Compiler:
-            LLVM Clang 22.1.8
-
-            CPU baseline:
-            x86-64-v2
-
-            Dependencies:
-            Pinned by the source vcpkg.json manifest and builtin-baseline.
-
-            Package:
-            Complete CMake build output.
-
-            Portability:
-            Not yet verified on a clean Windows installation.
+            ladybird/package/Ladybird-Windows-x64.zip
+            ladybird/package/SHA256SUMS.txt
