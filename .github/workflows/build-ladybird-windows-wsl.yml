@@ -5,51 +5,55 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Ladybird upstream branch, tag or commit
-        required: false
-        default: master
+        description: "Ladybird upstream branch, tag or commit SHA"
+        required: true
+        default: "master"
         type: string
+
       publish_release:
-        description: Publish GitHub prerelease
+        description: "Publish GitHub Pre-release"
         required: true
         default: false
         type: boolean
-
-  push:
-    branches:
-      - main
 
 permissions:
   contents: write
 
 concurrency:
-  group: ladybird-windows-${{ github.ref }}
+  group: ladybird-windows-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
+    name: Build Ladybird Windows x64
     runs-on: windows-2025
     timeout-minutes: 360
 
     env:
-      VCPKG_DISABLE_METRICS: 1
-      VCPKG_ROOT: ${{ github.workspace }}\.vcpkg-upstream
-      VCPKG_INSTALLATION_ROOT: ${{ github.workspace }}\.vcpkg-upstream
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      VCPKG_DISABLE_METRICS: "1"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Resolve Ladybird source ref
+      - name: Validate selected upstream ref
         id: source
         shell: pwsh
+        env:
+          LADYBIRD_REF: ${{ inputs.ref }}
         run: |
-          $ref = "${{ inputs.ref }}"
+          $ErrorActionPreference = "Stop"
+
+          $ref = $env:LADYBIRD_REF.Trim()
+
           if ([string]::IsNullOrWhiteSpace($ref)) {
-            $ref = "master"
+            throw "Please enter a branch, tag or commit SHA."
           }
-          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          "ref=$ref" | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Selected Ladybird ref: $ref"
 
       - name: Checkout Ladybird upstream
         uses: actions/checkout@v4
@@ -59,20 +63,30 @@ jobs:
           path: ladybird
           fetch-depth: 1
           submodules: recursive
+          persist-credentials: false
 
       - name: Record source revision
         shell: pwsh
         run: |
-          git -C ladybird rev-parse HEAD |
-            Out-File ladybird-commit.txt
+          $ErrorActionPreference = "Stop"
+
+          $commit = (git -C ladybird rev-parse HEAD).Trim()
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cannot resolve Ladybird commit."
+          }
+
+          $commit | Out-File ladybird-commit.txt
+
           git -C ladybird status --short |
             Out-File ladybird-status.txt
+
+          Write-Host "Ladybird commit: $commit"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -84,6 +98,7 @@ jobs:
 
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe"
           $installer = "$env:RUNNER_TEMP\LLVM-22.1.8-win64.exe"
+
           $expectedHash = "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c"
 
           Invoke-WebRequest -Uri $url -OutFile $installer
@@ -96,7 +111,8 @@ jobs:
 
           $installDir = "C:\LLVM-22.1.8"
 
-          $process = Start-Process -FilePath $installer `
+          $process = Start-Process `
+            -FilePath $installer `
             -ArgumentList "/S", "/D=$installDir" `
             -Wait -PassThru
 
@@ -109,11 +125,11 @@ jobs:
           }
 
           "$installDir\bin" |
-            Out-File -FilePath $env:GITHUB_PATH -Append
+            Out-File $env:GITHUB_PATH -Append
 
           & "$installDir\bin\clang-cl.exe" --version
 
-      - name: Install Ninja and NASM
+      - name: Install Ninja NASM and pkg-config
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -124,10 +140,10 @@ jobs:
           $nasm = (Get-Command nasm.exe -ErrorAction Stop).Source
 
           "NINJA_PATH=$ninja" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+            Out-File $env:GITHUB_ENV -Append
 
           "NASM_PATH=$nasm" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+            Out-File $env:GITHUB_ENV -Append
 
           ninja --version
           nasm -v
@@ -137,7 +153,8 @@ jobs:
         with:
           arch: x64
 
-      - name: Clone vcpkg at Ladybird manifest baseline
+      - name: Read vcpkg baseline
+        id: vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -151,7 +168,19 @@ jobs:
             throw "vcpkg builtin-baseline not found."
           }
 
-          $root = "$env:GITHUB_WORKSPACE\.vcpkg-upstream"
+          "baseline=$baseline" |
+            Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Ladybird vcpkg baseline: $baseline"
+
+      - name: Clone vcpkg at Ladybird baseline
+        shell: pwsh
+        env:
+          VCPKG_BASELINE: ${{ steps.vcpkg.outputs.baseline }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream"
 
           if (Test-Path $root) {
             Remove-Item $root -Recurse -Force
@@ -163,32 +192,32 @@ jobs:
             throw "vcpkg clone failed."
           }
 
-          git -C $root checkout --detach $baseline
+          git -C $root checkout --detach $env:VCPKG_BASELINE
 
           if ($LASTEXITCODE -ne 0) {
-            throw "vcpkg checkout failed."
+            throw "vcpkg baseline checkout failed."
           }
 
           $actual = (git -C $root rev-parse HEAD).Trim()
 
-          if ($actual -ne $baseline) {
+          if ($actual -ne $env:VCPKG_BASELINE) {
             throw "vcpkg baseline mismatch."
           }
 
-          Write-Host "vcpkg baseline: $actual"
+          Write-Host "Local vcpkg commit: $actual"
 
           "VCPKG_ROOT=$root" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+            Out-File $env:GITHUB_ENV -Append
 
           "VCPKG_INSTALLATION_ROOT=$root" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
+            Out-File $env:GITHUB_ENV -Append
 
       - name: Bootstrap local vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $root = "$env:GITHUB_WORKSPACE\.vcpkg-upstream"
+          $root = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream"
           $bootstrap = Join-Path $root "bootstrap-vcpkg.bat"
 
           if (!(Test-Path $bootstrap)) {
@@ -209,12 +238,12 @@ jobs:
 
           & $exe version
 
-      - name: Verify local vcpkg selection
+      - name: Verify local vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $root = (Resolve-Path "$env:GITHUB_WORKSPACE\.vcpkg-upstream").Path
+          $root = (Resolve-Path ".vcpkg-upstream").Path
           $toolchain = Join-Path $root "scripts\buildsystems\vcpkg.cmake"
 
           if (!(Test-Path $toolchain)) {
@@ -224,21 +253,21 @@ jobs:
           $toolchain = (Resolve-Path $toolchain).Path
 
           if ($toolchain -match "Microsoft Visual Studio") {
-            throw "Visual Studio vcpkg must not be used."
+            throw "Invalid Visual Studio vcpkg path."
           }
-
-          Write-Host "Local vcpkg root: $root"
-          Write-Host "Local vcpkg toolchain: $toolchain"
 
           $env:VCPKG_ROOT = $root
           $env:VCPKG_INSTALLATION_ROOT = $root
+
+          Write-Host "Local vcpkg root: $root"
+          Write-Host "Local vcpkg toolchain: $toolchain"
 
       - name: Configure Ladybird
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $repo = "$env:GITHUB_WORKSPACE"
+          $repo = $env:GITHUB_WORKSPACE
           $source = Join-Path $repo "ladybird"
           $build = Join-Path $source "Build\release"
 
@@ -251,7 +280,6 @@ jobs:
 
           $toolchain = (Resolve-Path $toolchain).Path
 
-          # Remove old cache so the VS toolchain cannot remain cached.
           if (Test-Path $build) {
             Remove-Item $build -Recurse -Force
           }
@@ -260,16 +288,18 @@ jobs:
             Out-Null
 
           $ninja = $env:NINJA_PATH
+          $clang = "C:/LLVM-22.1.8/bin/clang-cl.exe"
 
           if (!(Test-Path $ninja)) {
             throw "Ninja executable missing."
           }
 
-          $clang = "C:/LLVM-22.1.8/bin/clang-cl.exe"
-
           if (!(Test-Path $clang)) {
-            throw "LLVM clang-cl missing."
+            throw "Clang compiler missing."
           }
+
+          $env:VCPKG_ROOT = $vcpkgRoot
+          $env:VCPKG_INSTALLATION_ROOT = $vcpkgRoot
 
           $args = @(
             "-S", $source,
@@ -288,9 +318,9 @@ jobs:
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
           )
 
-          Write-Host "Using vcpkg: $vcpkgRoot"
-          Write-Host "Using toolchain: $toolchain"
-          Write-Host "Using compiler: $clang"
+          Write-Host "CMake source: $source"
+          Write-Host "CMake build: $build"
+          Write-Host "CMake toolchain: $toolchain"
 
           & cmake @args
 
@@ -351,10 +381,6 @@ jobs:
             throw "Wrong vcpkg root: $actualRoot"
           }
 
-          if ($actualToolchain -match "Microsoft Visual Studio") {
-            throw "Visual Studio vcpkg detected."
-          }
-
           $baselineMatch = [regex]::Match(
             $cache,
             '(?m)^LADYBIRD_BASELINE_CPU_TARGET:[^=]*=(.+)$'
@@ -366,7 +392,7 @@ jobs:
 
           Write-Host "PASS: Local vcpkg toolchain."
           Write-Host "PASS: Local vcpkg root."
-          Write-Host "PASS: x86-64-v2 baseline option."
+          Write-Host "PASS: CPU baseline."
 
       - name: Build Ladybird
         shell: pwsh
@@ -382,11 +408,14 @@ jobs:
           $code = $LASTEXITCODE
 
           if ($code -ne 0) {
-            Get-Content $log -Tail 250
+            if (Test-Path $log) {
+              Get-Content $log -Tail 250
+            }
+
             throw "Ladybird build failed: $code"
           }
 
-          Write-Host "Build completed."
+          Write-Host "Ladybird build completed."
 
       - name: Verify CPU baseline compile commands
         shell: pwsh
@@ -403,8 +432,13 @@ jobs:
 
           $clangCommands = @(
             $commands | Where-Object {
-              $_.command -match "clang-cl|clang\+\+" -or
-              ($_.arguments -and ($_.arguments -join " ") -match "clang-cl|clang\+\+")
+              $text = $_.command
+
+              if (!$text -and $_.arguments) {
+                $text = $_.arguments -join " "
+              }
+
+              $text -match "clang-cl|clang\+\+"
             }
           )
 
@@ -425,7 +459,7 @@ jobs:
           )
 
           if ($missing.Count -gt 0) {
-            throw "$($missing.Count) Clang compile commands missing x86-64-v2."
+            throw "$($missing.Count) Clang commands missing x86-64-v2."
           }
 
           $bad = @(
@@ -446,10 +480,13 @@ jobs:
 
           Write-Host "Verified $($clangCommands.Count) Clang compile commands."
 
-      - name: Collect build diagnostics
+      - name: Collect diagnostics
         if: always()
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force diagnostics |
+            Out-Null
+
           $files = @(
             "ladybird\Build\release\CMakeCache.txt",
             "ladybird\Build\release\compile_commands.json",
@@ -458,9 +495,6 @@ jobs:
             "ladybird-commit.txt",
             "ladybird-status.txt"
           )
-
-          New-Item -ItemType Directory -Force diagnostics |
-            Out-Null
 
           foreach ($file in $files) {
             if (Test-Path $file) {
