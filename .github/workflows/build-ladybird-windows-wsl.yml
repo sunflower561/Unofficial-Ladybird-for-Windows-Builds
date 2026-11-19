@@ -1,3 +1,4 @@
+
 name: Build Ladybird Windows x64
 
 on:
@@ -32,9 +33,9 @@ jobs:
       LLVM_VERSION: "22.1.8"
       BUILD_TYPE: "Release"
       BUILD_DIR: "Build/release"
-      VCPKG_ROOT: "${{ github.workspace }}/.vcpkg-upstream"
 
     steps:
+
       # ------------------------------------------------------------
       # 1. Checkout workflow repository
       # ------------------------------------------------------------
@@ -52,7 +53,7 @@ jobs:
           $ref = "${{ inputs.ref }}".Trim()
 
           if ([string]::IsNullOrWhiteSpace($ref)) {
-            throw "The Ladybird ref input cannot be empty."
+            throw "Ladybird ref cannot be empty."
           }
 
           git clone --no-tags https://github.com/LadybirdBrowser/ladybird.git ladybird
@@ -66,23 +67,25 @@ jobs:
           git fetch origin $ref
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to fetch Ladybird ref: $ref"
+            Pop-Location
+            throw "Failed to fetch ref: $ref"
           }
 
           git checkout FETCH_HEAD
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to checkout Ladybird ref: $ref"
+            Pop-Location
+            throw "Failed to checkout ref: $ref"
           }
 
-          Write-Host "Ladybird ref: $ref"
-          Write-Host "Ladybird commit:"
+          Write-Host "Selected ref: $ref"
+          Write-Host "Selected commit:"
           git rev-parse HEAD
 
           Pop-Location
 
       # ------------------------------------------------------------
-      # 3. Install Python
+      # 3. Python
       # ------------------------------------------------------------
 
       - name: Setup Python
@@ -92,14 +95,14 @@ jobs:
           architecture: "x64"
 
       # ------------------------------------------------------------
-      # 4. Install Rust
+      # 4. Rust
       # ------------------------------------------------------------
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       # ------------------------------------------------------------
-      # 5. Install build tools
+      # 5. Build tools
       # ------------------------------------------------------------
 
       - name: Install Ninja and build tools
@@ -111,19 +114,19 @@ jobs:
             throw "Failed to install build tools."
           }
 
-          refreshenv
+          $env:Path = "$env:ChocolateyInstall\bin;$env:Path"
 
           $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
 
           if (-not $ninja) {
-            throw "Ninja executable was not found in PATH."
+            throw "Ninja executable was not found."
           }
 
-          Write-Host "Ninja location: $($ninja.Source)"
+          Write-Host "Ninja path: $($ninja.Source)"
           ninja --version
 
       # ------------------------------------------------------------
-      # 6. Install LLVM
+      # 6. LLVM 22.1.8
       # ------------------------------------------------------------
 
       - name: Install LLVM ${{ env.LLVM_VERSION }}
@@ -131,6 +134,7 @@ jobs:
         run: |
           $version = "${{ env.LLVM_VERSION }}"
           $installer = "$env:RUNNER_TEMP\LLVM-$version-win64.exe"
+
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
 
           Write-Host "Downloading LLVM $version"
@@ -148,39 +152,49 @@ jobs:
             -PassThru
 
           if ($process.ExitCode -ne 0) {
-            throw "LLVM installation failed. Exit code: $($process.ExitCode)"
+            throw "LLVM installation failed: $($process.ExitCode)"
           }
 
           if (!(Test-Path "C:\LLVM\bin\clang-cl.exe")) {
-            throw "clang-cl.exe was not found after LLVM installation."
+            throw "clang-cl.exe was not found."
           }
 
-          "C:\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "C:\LLVM\bin" | Out-File `
+            -FilePath $env:GITHUB_PATH `
+            -Encoding utf8 `
+            -Append
 
           & "C:\LLVM\bin\clang-cl.exe" --version
 
       # ------------------------------------------------------------
-      # 7. Configure MSVC environment
+      # 7. MSVC environment
       # ------------------------------------------------------------
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          toolset: "14.52"
 
       # ------------------------------------------------------------
-      # 8. Verify compiler and tools
+      # 8. Verify environment
       # ------------------------------------------------------------
 
       - name: Verify build environment
         shell: pwsh
         run: |
-          Write-Host "===== Windows ====="
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
-
           Write-Host "===== MSVC ====="
+
+          $cl = Get-Command cl.exe -ErrorAction Stop
+
+          Write-Host "Compiler path: $($cl.Source)"
+
           cl.exe
+
+          Write-Host "===== MSVC Environment ====="
+
+          Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
+          Write-Host "VCToolsVersion=$env:VCToolsVersion"
+          Write-Host "VisualStudioVersion=$env:VisualStudioVersion"
 
           Write-Host "===== Clang ====="
           clang-cl.exe --version
@@ -199,18 +213,19 @@ jobs:
           cargo --version
 
       # ------------------------------------------------------------
-      # 9. Prepare local vcpkg
+      # 9. Checkout local vcpkg
       # ------------------------------------------------------------
 
       - name: Checkout vcpkg
         shell: pwsh
         run: |
-          $manifest = Get-Content "ladybird/vcpkg.json" -Raw | ConvertFrom-Json
+          $manifest = Get-Content "ladybird/vcpkg.json" -Raw |
+            ConvertFrom-Json
 
           $baseline = $manifest.'builtin-baseline'
 
           if ([string]::IsNullOrWhiteSpace($baseline)) {
-            throw "builtin-baseline was not found in ladybird/vcpkg.json."
+            throw "builtin-baseline was not found."
           }
 
           Write-Host "Ladybird vcpkg baseline: $baseline"
@@ -226,6 +241,7 @@ jobs:
           git checkout $baseline
 
           if ($LASTEXITCODE -ne 0) {
+            Pop-Location
             throw "Failed to checkout vcpkg baseline."
           }
 
@@ -233,6 +249,10 @@ jobs:
 
           Write-Host "vcpkg commit:"
           git -C .vcpkg-upstream rev-parse HEAD
+
+      # ------------------------------------------------------------
+      # 10. Bootstrap vcpkg
+      # ------------------------------------------------------------
 
       - name: Bootstrap vcpkg
         shell: pwsh
@@ -250,39 +270,48 @@ jobs:
           .\.vcpkg-upstream\vcpkg.exe version
 
       # ------------------------------------------------------------
-      # 10. Configure Ladybird
+      # 11. Configure Ladybird
       # ------------------------------------------------------------
 
       - name: Configure Ladybird
         shell: pwsh
         run: |
           $workspace = $env:GITHUB_WORKSPACE
+
           $ladybird = Join-Path $workspace "ladybird"
           $vcpkg = Join-Path $workspace ".vcpkg-upstream"
 
-          $toolchain = Join-Path $vcpkg "scripts/buildsystems/vcpkg.cmake"
-          $overlayPorts = Join-Path $ladybird "Meta/CMake/vcpkg/overlay-ports"
-          $overlayTriplets = Join-Path $ladybird "Meta/CMake/vcpkg/overlay-triplets"
+          $toolchain = Join-Path `
+            $vcpkg `
+            "scripts/buildsystems/vcpkg.cmake"
+
+          $overlayPorts = Join-Path `
+            $ladybird `
+            "Meta/CMake/vcpkg/overlay-ports"
+
+          $overlayTriplets = Join-Path `
+            $ladybird `
+            "Meta/CMake/vcpkg/overlay-triplets"
 
           if (!(Test-Path $toolchain)) {
-            throw "Local vcpkg toolchain file not found: $toolchain"
+            throw "Local vcpkg toolchain not found."
           }
 
           if (!(Test-Path $overlayPorts)) {
-            throw "Ladybird overlay ports directory not found."
+            throw "Ladybird overlay ports not found."
           }
 
           if (!(Test-Path $overlayTriplets)) {
-            throw "Ladybird overlay triplets directory not found."
+            throw "Ladybird overlay triplets not found."
           }
 
           $env:VCPKG_ROOT = $vcpkg
 
-          $ninja = (Get-Command ninja.exe).Source
+          $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source
 
-          Write-Host "Using vcpkg: $vcpkg"
-          Write-Host "Using toolchain: $toolchain"
-          Write-Host "Using Ninja: $ninja"
+          Write-Host "vcpkg: $vcpkg"
+          Write-Host "Toolchain: $toolchain"
+          Write-Host "Ninja: $ninja"
 
           Push-Location $ladybird
 
@@ -306,11 +335,11 @@ jobs:
           Pop-Location
 
           if ($result -ne 0) {
-            throw "Ladybird CMake configuration failed with exit code $result."
+            throw "CMake configuration failed: $result"
           }
 
       # ------------------------------------------------------------
-      # 11. Verify CMake configuration
+      # 12. Verify CMake configuration
       # ------------------------------------------------------------
 
       - name: Verify CMake configuration
@@ -328,18 +357,16 @@ jobs:
             "CMAKE_TOOLCHAIN_FILE:FILEPATH=.*\.vcpkg-upstream",
             "Z_VCPKG_ROOT_DIR:INTERNAL=.*\.vcpkg-upstream",
             "VCPKG_TARGET_TRIPLET:STRING=x64-windows",
-            "LADYBIRD_BASELINE_CPU_TARGET:UNINITIALIZED=ON",
-            "CMAKE_BUILD_TYPE:UNINITIALIZED=Release"
+            "LADYBIRD_BASELINE_CPU_TARGET:UNINITIALIZED=ON"
           )
 
           foreach ($check in $checks) {
             if ($content -notmatch $check) {
-              Write-Host "CMakeCache validation failed: $check"
-              throw "CMake configuration validation failed."
+              throw "CMakeCache validation failed: $check"
             }
           }
 
-          Write-Host "===== Relevant CMakeCache entries ====="
+          Write-Host "===== CMake configuration ====="
 
           Select-String -Path $cache -Pattern `
             "CMAKE_TOOLCHAIN_FILE",
@@ -354,7 +381,7 @@ jobs:
             "CMAKE_BUILD_TYPE"
 
       # ------------------------------------------------------------
-      # 12. Build
+      # 13. Build Ladybird
       # ------------------------------------------------------------
 
       - name: Build Ladybird
@@ -362,9 +389,12 @@ jobs:
         run: |
           Push-Location ladybird
 
-          $log = Join-Path $env:GITHUB_WORKSPACE "ladybird-build.log"
+          $log = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "ladybird-build.log"
 
-          cmake --build Build/release --parallel $env:NUMBER_OF_PROCESSORS 2>&1 |
+          & cmake --build Build/release `
+            --parallel $env:NUMBER_OF_PROCESSORS 2>&1 |
             Tee-Object -FilePath $log
 
           $result = $LASTEXITCODE
@@ -372,11 +402,11 @@ jobs:
           Pop-Location
 
           if ($result -ne 0) {
-            throw "Ladybird build failed with exit code $result."
+            throw "Ladybird build failed: $result"
           }
 
       # ------------------------------------------------------------
-      # 13. Verify build output
+      # 14. Verify build output
       # ------------------------------------------------------------
 
       - name: Verify build output
@@ -385,7 +415,7 @@ jobs:
           $release = "ladybird/Build/release"
 
           if (!(Test-Path $release)) {
-            throw "Build/release directory does not exist."
+            throw "Build/release does not exist."
           }
 
           Write-Host "===== EXE files ====="
@@ -398,32 +428,36 @@ jobs:
           Get-ChildItem $release -Recurse -Filter *.dll |
             Select-Object FullName, Length
 
-          $ladybirdExe = Get-ChildItem $release -Recurse -Filter "Ladybird.exe" |
+          $ladybirdExe = Get-ChildItem `
+            $release `
+            -Recurse `
+            -Filter "Ladybird.exe" |
             Select-Object -First 1
 
           if (!$ladybirdExe) {
-            throw "Ladybird.exe was not found in Build/release."
+            throw "Ladybird.exe was not found."
           }
 
-          Write-Host "Ladybird executable: $($ladybirdExe.FullName)"
+          Write-Host "Main executable: $($ladybirdExe.FullName)"
 
       # ------------------------------------------------------------
-      # 14. Clean development and test files
-      #     Keep runtime EXE, DLL, Qt plugins and resources.
+      # 15. Remove development and test files
       # ------------------------------------------------------------
 
       - name: Remove development and test files
         shell: pwsh
         run: |
-          $release = Join-Path $env:GITHUB_WORKSPACE "ladybird/Build/release"
+          $release = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "ladybird/Build/release"
 
           if (!(Test-Path $release)) {
             throw "Release directory not found."
           }
 
-          Write-Host "Cleaning: $release"
+          Write-Host "Cleaning $release"
 
-          # Development / intermediate file extensions.
+          # Intermediate and development extensions.
           $extensions = @(
             ".obj",
             ".o",
@@ -454,7 +488,6 @@ jobs:
             "CMakeFiles",
             "Testing",
             "_deps",
-            "test",
             "tests",
             "Tests"
           )
@@ -465,10 +498,11 @@ jobs:
             } |
             Sort-Object FullName -Descending |
             ForEach-Object {
-              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item $_.FullName -Recurse -Force `
+                -ErrorAction SilentlyContinue
             }
 
-          # CMake / Ninja build metadata.
+          # CMake and Ninja metadata.
           $metadataNames = @(
             "CMakeCache.txt",
             "cmake_install.cmake",
@@ -504,8 +538,7 @@ jobs:
               Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
             }
 
-          # Common test executable naming patterns.
-          # Does not remove ordinary runtime executables.
+          # Common test executable names.
           Get-ChildItem $release -Recurse -File -Filter *.exe |
             Where-Object {
               $_.BaseName -match '(^|[-_])(test|tests|unittest|benchmark)([-_]|$)'
@@ -517,25 +550,33 @@ jobs:
 
           Write-Host "Cleanup completed."
 
-          Write-Host "Remaining EXE files:"
+          Write-Host "===== Remaining EXE ====="
+
           Get-ChildItem $release -Recurse -Filter *.exe |
             Select-Object FullName, Length
 
-          Write-Host "Remaining DLL files:"
+          Write-Host "===== Remaining DLL ====="
+
           Get-ChildItem $release -Recurse -Filter *.dll |
             Select-Object FullName, Length
 
       # ------------------------------------------------------------
-      # 15. Package ZIP and SHA256
+      # 16. Package ZIP and SHA256
       # ------------------------------------------------------------
 
       - name: Package Ladybird
         shell: pwsh
         run: |
-          $release = Join-Path $env:GITHUB_WORKSPACE "ladybird/Build/release"
-          $output = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $release = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "ladybird/Build/release"
 
-          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $output = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "dist"
+
+          New-Item -ItemType Directory -Force -Path $output |
+            Out-Null
 
           $zip = Join-Path $output "Ladybird-Windows-x64.zip"
 
@@ -560,13 +601,15 @@ jobs:
               -Encoding ascii
 
           Write-Host "===== Package ====="
+
           Get-Item $zip | Select-Object Name, Length
 
           Write-Host "===== SHA256 ====="
+
           Get-Content "$output/Ladybird-Windows-x64.sha256"
 
       # ------------------------------------------------------------
-      # 16. Upload Actions Artifact
+      # 17. Upload Actions Artifact
       # ------------------------------------------------------------
 
       - name: Upload Windows x64 ZIP
@@ -581,7 +624,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # 17. Optional GitHub Pre-release
+      # 18. Optional GitHub Pre-release
       # ------------------------------------------------------------
 
       - name: Publish GitHub Pre-release
@@ -598,65 +641,59 @@ jobs:
             dist/Ladybird-Windows-x64.sha256
 
       # ------------------------------------------------------------
-      # 18. Collect vcpkg failure logs
+      # 19. Collect vcpkg failure logs
       # ------------------------------------------------------------
 
       - name: Collect vcpkg failure logs
         if: ${{ failure() }}
         shell: pwsh
         run: |
-          $root = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream/buildtrees"
-          $output = Join-Path $env:GITHUB_WORKSPACE "vcpkg-failure-logs"
+          $root = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            ".vcpkg-upstream/buildtrees"
 
-          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $output = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "vcpkg-failure-logs"
+
+          New-Item -ItemType Directory -Force -Path $output |
+            Out-Null
 
           if (!(Test-Path $root)) {
             Write-Host "vcpkg buildtrees directory does not exist."
             exit 0
           }
 
-          # Collect dav1d logs first because this was the previous
-          # failure point. Also collect logs from other failed ports.
+          # Search all ports, not only dav1d.
+          Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match 'out\.log$|err\.log$|meson-log\.txt$|config\.log$'
+            } |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($root.Length).TrimStart('\')
 
-          $targets = @(
-            "dav1d",
-            "meson",
-            "vcpkg"
-          )
+              $destination = Join-Path $output $relative
 
-          foreach ($target in $targets) {
-            $dir = Join-Path $root $target
+              $destinationDir = Split-Path $destination -Parent
 
-            if (!(Test-Path $dir)) {
-              continue
+              New-Item -ItemType Directory -Force -Path $destinationDir |
+                Out-Null
+
+              Copy-Item $_.FullName $destination -Force
+
+              Write-Host "Collected: $relative"
             }
 
-            Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -match 'out\.log$|err\.log$|meson-log\.txt$|config\.log$'
-              } |
-              ForEach-Object {
-                $relative = $_.FullName.Substring($root.Length).TrimStart('\')
-                $destination = Join-Path $output $relative
-                $destinationDir = Split-Path $destination -Parent
-
-                New-Item -ItemType Directory -Force -Path $destinationDir |
-                  Out-Null
-
-                Copy-Item $_.FullName $destination -Force
-
-                Write-Host "Collected: $relative"
-              }
-          }
-
-          # Collect the main CMake configuration cache if available.
-          $cache = Join-Path $env:GITHUB_WORKSPACE "ladybird/Build/release/CMakeCache.txt"
+          # Collect CMake cache if available.
+          $cache = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "ladybird/Build/release/CMakeCache.txt"
 
           if (Test-Path $cache) {
             Copy-Item $cache (Join-Path $output "CMakeCache.txt") -Force
           }
 
-          Write-Host "Failure logs collected."
+          Write-Host "Failure log collection completed."
 
       - name: Upload vcpkg failure logs
         if: ${{ failure() }}
@@ -668,7 +705,7 @@ jobs:
           retention-days: 7
 
       # ------------------------------------------------------------
-      # 19. Upload build log on failure
+      # 20. Upload build log on failure
       # ------------------------------------------------------------
 
       - name: Upload build log
