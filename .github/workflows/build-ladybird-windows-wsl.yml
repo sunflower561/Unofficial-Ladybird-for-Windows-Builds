@@ -31,8 +31,6 @@ jobs:
 
     env:
       LLVM_VERSION: "22.1.8"
-      BUILD_TYPE: "Release"
-      BUILD_DIR: "Build/release"
 
     steps:
 
@@ -68,14 +66,14 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             Pop-Location
-            throw "Failed to fetch ref: $ref"
+            throw "Failed to fetch Ladybird ref: $ref"
           }
 
           git checkout FETCH_HEAD
 
           if ($LASTEXITCODE -ne 0) {
             Pop-Location
-            throw "Failed to checkout ref: $ref"
+            throw "Failed to checkout Ladybird ref: $ref"
           }
 
           Write-Host "Selected ref: $ref"
@@ -102,7 +100,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # ------------------------------------------------------------
-      # 5. Build tools
+      # 5. Install build tools
       # ------------------------------------------------------------
 
       - name: Install Ninja and build tools
@@ -118,26 +116,24 @@ jobs:
 
           $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
 
-          if (-not $ninja) {
+          if (!$ninja) {
             throw "Ninja executable was not found."
           }
 
-          Write-Host "Ninja path: $($ninja.Source)"
+          Write-Host "Ninja: $($ninja.Source)"
           ninja --version
 
       # ------------------------------------------------------------
-      # 6. LLVM 22.1.8
+      # 6. Install LLVM 22.1.8
       # ------------------------------------------------------------
 
-      - name: Install LLVM ${{ env.LLVM_VERSION }}
+      - name: Install LLVM
         shell: pwsh
         run: |
           $version = "${{ env.LLVM_VERSION }}"
           $installer = "$env:RUNNER_TEMP\LLVM-$version-win64.exe"
 
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
-
-          Write-Host "Downloading LLVM $version"
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
@@ -167,7 +163,7 @@ jobs:
           & "C:\LLVM\bin\clang-cl.exe" --version
 
       # ------------------------------------------------------------
-      # 7. MSVC environment
+      # 7. Setup MSVC
       # ------------------------------------------------------------
 
       - name: Setup MSVC environment
@@ -176,7 +172,7 @@ jobs:
           arch: x64
 
       # ------------------------------------------------------------
-      # 8. Verify environment
+      # 8. Verify build environment
       # ------------------------------------------------------------
 
       - name: Verify build environment
@@ -186,17 +182,15 @@ jobs:
 
           $cl = Get-Command cl.exe -ErrorAction Stop
 
-          Write-Host "Compiler path: $($cl.Source)"
+          Write-Host "Compiler: $($cl.Source)"
 
           cl.exe
-
-          Write-Host "===== MSVC Environment ====="
 
           Write-Host "VCToolsInstallDir=$env:VCToolsInstallDir"
           Write-Host "VCToolsVersion=$env:VCToolsVersion"
           Write-Host "VisualStudioVersion=$env:VisualStudioVersion"
 
-          Write-Host "===== Clang ====="
+          Write-Host "===== LLVM ====="
           clang-cl.exe --version
 
           Write-Host "===== CMake ====="
@@ -213,7 +207,7 @@ jobs:
           cargo --version
 
       # ------------------------------------------------------------
-      # 9. Checkout local vcpkg
+      # 9. Checkout local vcpkg at Ladybird baseline
       # ------------------------------------------------------------
 
       - name: Checkout vcpkg
@@ -225,7 +219,7 @@ jobs:
           $baseline = $manifest.'builtin-baseline'
 
           if ([string]::IsNullOrWhiteSpace($baseline)) {
-            throw "builtin-baseline was not found."
+            throw "vcpkg builtin-baseline was not found."
           }
 
           Write-Host "Ladybird vcpkg baseline: $baseline"
@@ -291,51 +285,67 @@ jobs:
 
           $overlayTriplets = Join-Path `
             $ladybird `
-            "Meta/CMake/vcpkg/overlay-triplets"
+            "Meta/CMake/vcpkg/release-triplets"
+
+          # Verify all required paths.
 
           if (!(Test-Path $toolchain)) {
-            throw "Local vcpkg toolchain not found."
+            throw "Local vcpkg toolchain not found: $toolchain"
           }
 
           if (!(Test-Path $overlayPorts)) {
-            throw "Ladybird overlay ports not found."
+            throw "Ladybird overlay ports not found: $overlayPorts"
           }
 
           if (!(Test-Path $overlayTriplets)) {
-            throw "Ladybird overlay triplets not found."
+            throw "Ladybird release triplets not found: $overlayTriplets"
           }
+
+          Write-Host "===== Release Triplets ====="
+
+          Get-ChildItem $overlayTriplets -File |
+            Select-Object Name
+
+          Write-Host "===== Overlay Ports ====="
+
+          Write-Host $overlayPorts
+          Write-Host "===== vcpkg ====="
+          Write-Host $vcpkg
+          Write-Host "===== Toolchain ====="
+          Write-Host $toolchain
 
           $env:VCPKG_ROOT = $vcpkg
 
           $ninja = (Get-Command ninja.exe -ErrorAction Stop).Source
 
-          Write-Host "vcpkg: $vcpkg"
-          Write-Host "Toolchain: $toolchain"
-          Write-Host "Ninja: $ninja"
-
           Push-Location $ladybird
 
-          cmake `
-            -S . `
-            -B Build/release `
-            -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_MAKE_PROGRAM="$ninja" `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
-            -DVCPKG_ROOT="$vcpkg" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DVCPKG_OVERLAY_PORTS="$overlayPorts" `
-            -DVCPKG_OVERLAY_TRIPLETS="$overlayTriplets" `
-            -DLADYBIRD_BASELINE_CPU_TARGET=ON
+          $cmakeArgs = @(
+            "-S", ".",
+            "-B", "Build/release",
+            "-G", "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_MAKE_PROGRAM=$ninja",
+            "-DCMAKE_C_COMPILER=clang-cl",
+            "-DCMAKE_CXX_COMPILER=clang-cl",
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+            "-DVCPKG_ROOT=$vcpkg",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows",
+            "-DVCPKG_OVERLAY_PORTS=$overlayPorts",
+            "-DVCPKG_OVERLAY_TRIPLETS=$overlayTriplets",
+            "-DLADYBIRD_BASELINE_CPU_TARGET=ON"
+          )
+
+          Write-Host "===== CMake Configure ====="
+
+          & cmake @cmakeArgs
 
           $result = $LASTEXITCODE
 
           Pop-Location
 
           if ($result -ne 0) {
-            throw "CMake configuration failed: $result"
+            throw "Ladybird CMake configuration failed: $result"
           }
 
       # ------------------------------------------------------------
@@ -357,6 +367,7 @@ jobs:
             "CMAKE_TOOLCHAIN_FILE:FILEPATH=.*\.vcpkg-upstream",
             "Z_VCPKG_ROOT_DIR:INTERNAL=.*\.vcpkg-upstream",
             "VCPKG_TARGET_TRIPLET:STRING=x64-windows",
+            "VCPKG_OVERLAY_TRIPLETS:STRING=.*release-triplets",
             "LADYBIRD_BASELINE_CPU_TARGET:UNINITIALIZED=ON"
           )
 
@@ -366,7 +377,7 @@ jobs:
             }
           }
 
-          Write-Host "===== CMake configuration ====="
+          Write-Host "===== CMakeCache ====="
 
           Select-String -Path $cache -Pattern `
             "CMAKE_TOOLCHAIN_FILE",
@@ -457,7 +468,8 @@ jobs:
 
           Write-Host "Cleaning $release"
 
-          # Intermediate and development extensions.
+          # Intermediate development files.
+
           $extensions = @(
             ".obj",
             ".o",
@@ -480,10 +492,12 @@ jobs:
               $extensions -contains $_.Extension.ToLowerInvariant()
             } |
             ForEach-Object {
-              Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+              Remove-Item $_.FullName -Force `
+                -ErrorAction SilentlyContinue
             }
 
-          # Build-system and test directories.
+          # Build and test directories.
+
           $directoryNames = @(
             "CMakeFiles",
             "Testing",
@@ -503,6 +517,7 @@ jobs:
             }
 
           # CMake and Ninja metadata.
+
           $metadataNames = @(
             "CMakeCache.txt",
             "cmake_install.cmake",
@@ -519,10 +534,12 @@ jobs:
               $metadataNames -contains $_.Name
             } |
             ForEach-Object {
-              Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+              Remove-Item $_.FullName -Force `
+                -ErrorAction SilentlyContinue
             }
 
           # Visual Studio project metadata.
+
           $metadataExtensions = @(
             ".sln",
             ".vcxproj",
@@ -535,17 +552,20 @@ jobs:
               $metadataExtensions -contains $_.Extension.ToLowerInvariant()
             } |
             ForEach-Object {
-              Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+              Remove-Item $_.FullName -Force `
+                -ErrorAction SilentlyContinue
             }
 
-          # Common test executable names.
+          # Common test executable names only.
+
           Get-ChildItem $release -Recurse -File -Filter *.exe |
             Where-Object {
               $_.BaseName -match '(^|[-_])(test|tests|unittest|benchmark)([-_]|$)'
             } |
             ForEach-Object {
               Write-Host "Removing test executable: $($_.FullName)"
-              Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+              Remove-Item $_.FullName -Force `
+                -ErrorAction SilentlyContinue
             }
 
           Write-Host "Cleanup completed."
@@ -659,38 +679,49 @@ jobs:
           New-Item -ItemType Directory -Force -Path $output |
             Out-Null
 
-          if (!(Test-Path $root)) {
-            Write-Host "vcpkg buildtrees directory does not exist."
-            exit 0
+          if (Test-Path $root) {
+            Get-ChildItem $root -Recurse -File `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -match 'out\.log$|err\.log$|meson-log\.txt$|config\.log$'
+              } |
+              ForEach-Object {
+                $relative = $_.FullName.Substring($root.Length).TrimStart('\')
+
+                $destination = Join-Path $output $relative
+                $destinationDir = Split-Path $destination -Parent
+
+                New-Item -ItemType Directory -Force -Path $destinationDir |
+                  Out-Null
+
+                Copy-Item $_.FullName $destination -Force
+
+                Write-Host "Collected: $relative"
+              }
           }
 
-          # Search all ports, not only dav1d.
-          Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Name -match 'out\.log$|err\.log$|meson-log\.txt$|config\.log$'
-            } |
-            ForEach-Object {
-              $relative = $_.FullName.Substring($root.Length).TrimStart('\')
+          # Collect CMake manifest install log.
 
-              $destination = Join-Path $output $relative
+          $manifestLog = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "ladybird/Build/release/vcpkg-manifest-install.log"
 
-              $destinationDir = Split-Path $destination -Parent
+          if (Test-Path $manifestLog) {
+            Copy-Item $manifestLog `
+              (Join-Path $output "vcpkg-manifest-install.log") `
+              -Force
+          }
 
-              New-Item -ItemType Directory -Force -Path $destinationDir |
-                Out-Null
+          # Collect CMake cache.
 
-              Copy-Item $_.FullName $destination -Force
-
-              Write-Host "Collected: $relative"
-            }
-
-          # Collect CMake cache if available.
           $cache = Join-Path `
             $env:GITHUB_WORKSPACE `
             "ladybird/Build/release/CMakeCache.txt"
 
           if (Test-Path $cache) {
-            Copy-Item $cache (Join-Path $output "CMakeCache.txt") -Force
+            Copy-Item $cache `
+              (Join-Path $output "CMakeCache.txt") `
+              -Force
           }
 
           Write-Host "Failure log collection completed."
