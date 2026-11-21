@@ -1,16 +1,16 @@
 
-name: Ladybird Windows x64
+name: Ladybird Windows x64 Build
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird upstream branch, tag, or commit SHA"
+        description: "Ladybird upstream branch, tag or commit SHA"
         required: true
         default: "master"
         type: string
       publish_release:
-        description: "Publish a GitHub Pre-release"
+        description: "Publish GitHub Pre-release"
         required: true
         default: false
         type: boolean
@@ -19,54 +19,66 @@ permissions:
   contents: write
 
 concurrency:
-  group: ladybird-windows-${{ github.ref }}
+  group: ladybird-windows-build
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build and package Ladybird
+    name: Build Ladybird Windows x64
     runs-on: windows-2025
     timeout-minutes: 360
 
     env:
-      LLVM_VERSION: "22.1.8"
+      UPSTREAM_REPO: https://github.com/LadybirdBrowser/ladybird.git
       BUILD_DIR: ladybird/Build/release
-      DIST_DIR: dist
+      VCPKG_ROOT: .vcpkg-upstream
+      LLVM_VERSION: 22.1.8
+      PACKAGE_NAME: Ladybird-Windows-x64
 
     steps:
       - name: Checkout packaging repository
         uses: actions/checkout@v4
 
-      - name: Prepare directories
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build tools
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path logs, dist | Out-Null
+          $ErrorActionPreference = "Stop"
 
-      - name: Clone Ladybird upstream
+          choco install ninja nasm pkgconfiglite -y --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey tool installation failed."
+          }
+
+      - name: Install LLVM
         shell: pwsh
         run: |
-          git clone --filter=blob:none https://github.com/LadybirdBrowser/ladybird.git ladybird
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to clone Ladybird."
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:LLVM_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process -FilePath $installer `
+            -ArgumentList "/S", "/D=C:\LLVM" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "LLVM installation failed: $($process.ExitCode)"
           }
 
-          git -C ladybird fetch --force origin "${{ inputs.ref }}"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to fetch upstream ref: ${{ inputs.ref }}"
+          if (-not (Test-Path "C:\LLVM\bin\clang-cl.exe")) {
+            throw "clang-cl.exe was not installed."
           }
 
-          git -C ladybird checkout --detach FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to checkout requested upstream ref."
-          }
-
-          $commit = git -C ladybird rev-parse HEAD
-          $short = git -C ladybird rev-parse --short HEAD
-
-          "LADYBIRD_COMMIT=$commit" >> $env:GITHUB_ENV
-          "LADYBIRD_SHORT_COMMIT=$short" >> $env:GITHUB_ENV
-
-          Write-Host "Ladybird commit: $commit"
+          "C:\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -76,157 +88,161 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install build utilities
-        shell: pwsh
-        run: |
-          choco install ninja nasm pkgconfiglite -y --no-progress
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install build utilities."
-          }
-
-      - name: Install LLVM
-        shell: pwsh
-        run: |
-          $llvmRoot = "C:\LLVM"
-          $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
-          $installer = "$env:RUNNER_TEMP\LLVM-setup.exe"
-
-          Invoke-WebRequest -Uri $llvmUrl -OutFile $installer
-
-          $process = Start-Process -FilePath $installer `
-            -ArgumentList "/S", "/D=$llvmRoot" `
-            -Wait -PassThru
-
-          if ($process.ExitCode -ne 0) {
-            throw "LLVM installer failed with exit code $($process.ExitCode)."
-          }
-
-          if (-not (Test-Path "$llvmRoot\bin\clang-cl.exe")) {
-            throw "LLVM installation failed: clang-cl.exe not found."
-          }
-
-          "$llvmRoot\bin" >> $env:GITHUB_PATH
-          "LLVM_ROOT=$llvmRoot" >> $env:GITHUB_ENV
-
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
       - name: Verify build tools
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $tools = @(
-            "cl.exe",
-            "clang-cl.exe",
-            "clang.exe",
-            "lld-link.exe",
-            "ninja.exe",
-            "cmake.exe",
-            "python.exe",
-            "rustc.exe",
-            "cargo.exe",
-            "nasm.exe"
+            "cmake",
+            "ninja",
+            "clang-cl",
+            "clang",
+            "rustc",
+            "cargo",
+            "python",
+            "git"
           )
 
           foreach ($tool in $tools) {
-            $found = Get-Command $tool -ErrorAction SilentlyContinue
+            $command = Get-Command $tool -ErrorAction SilentlyContinue
 
-            if (-not $found) {
+            if (-not $command) {
               throw "Required tool not found: $tool"
             }
 
-            Write-Host "$tool -> $($found.Source)"
+            Write-Host "$tool : $($command.Source)"
           }
 
-          clang-cl.exe --version
-          cmake.exe --version
-          ninja.exe --version
+          Write-Host "`n=== Compiler versions ==="
+          clang-cl --version
+          cmake --version
+          ninja --version
+          rustc --version
+          python --version
 
-      - name: Read vcpkg baseline
-        id: vcpkg
+      - name: Clone Ladybird upstream
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          git clone --filter=blob:none $env:UPSTREAM_REPO ladybird
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ladybird clone failed."
+          }
+
+          Push-Location ladybird
+
+          try {
+            git fetch origin "${{ inputs.ref }}" --depth=1
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to fetch requested upstream ref."
+            }
+
+            git checkout FETCH_HEAD
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to checkout requested upstream ref."
+            }
+
+            $commit = git rev-parse HEAD
+
+            Write-Host "Ladybird commit: $commit"
+            "LADYBIRD_COMMIT=$commit" >> $env:GITHUB_ENV
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Read vcpkg baseline
+        id: baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
           $manifest = Get-Content "ladybird/vcpkg.json" -Raw |
             ConvertFrom-Json
 
           $baseline = $manifest.'builtin-baseline'
 
           if ([string]::IsNullOrWhiteSpace($baseline)) {
-            throw "builtin-baseline was not found in ladybird/vcpkg.json."
+            throw "builtin-baseline is missing from ladybird/vcpkg.json"
           }
 
-          "baseline=$baseline" >> $env:GITHUB_OUTPUT
           Write-Host "vcpkg baseline: $baseline"
+          "value=$baseline" >> $env:GITHUB_OUTPUT
 
-      - name: Checkout vcpkg
+      - name: Checkout vcpkg at Ladybird baseline
         shell: pwsh
         run: |
-          git clone https://github.com/microsoft/vcpkg.git .vcpkg-upstream
+          $ErrorActionPreference = "Stop"
+
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to clone vcpkg."
+            throw "vcpkg clone failed."
           }
 
-          git -C .vcpkg-upstream checkout "${{ steps.vcpkg.outputs.baseline }}"
+          Push-Location $env:VCPKG_ROOT
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to checkout vcpkg baseline."
+          try {
+            git checkout "${{ steps.baseline.outputs.value }}"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to checkout vcpkg baseline."
+            }
+
+            .\bootstrap-vcpkg.bat -disableMetrics
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "vcpkg bootstrap failed."
+            }
           }
-
-          & .\.vcpkg-upstream\bootstrap-vcpkg.bat -disableMetrics
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "vcpkg bootstrap failed."
+          finally {
+            Pop-Location
           }
-
-      - name: Validate Ladybird vcpkg overlay directories
-        shell: pwsh
-        run: |
-          $ports = "ladybird/Meta/CMake/vcpkg/overlay-ports"
-          $triplets = "ladybird/Meta/CMake/vcpkg/release-triplets"
-
-          if (-not (Test-Path $ports -PathType Container)) {
-            throw "Ladybird overlay ports directory not found: $ports"
-          }
-
-          if (-not (Test-Path $triplets -PathType Container)) {
-            throw "Ladybird release triplets directory not found: $triplets"
-          }
-
-          Write-Host "Overlay ports: $ports"
-          Write-Host "Overlay triplets: $triplets"
 
       - name: Configure Ladybird
         shell: pwsh
         run: |
-          $toolchain = (Resolve-Path ".vcpkg-upstream/scripts/buildsystems/vcpkg.cmake").Path
-          $vcpkgRoot = (Resolve-Path ".vcpkg-upstream").Path
-          $overlayPorts = (Resolve-Path "ladybird/Meta/CMake/vcpkg/overlay-ports").Path
-          $overlayTriplets = (Resolve-Path "ladybird/Meta/CMake/vcpkg/release-triplets").Path
+          $ErrorActionPreference = "Stop"
 
-          $buildPath = "ladybird/Build/release"
-          New-Item -ItemType Directory -Force -Path $buildPath | Out-Null
+          $root = (Get-Location).Path
+          $vcpkg = Join-Path $root ".vcpkg-upstream"
+          $toolchain = Join-Path $vcpkg "scripts/buildsystems/vcpkg.cmake"
 
-          $cmakeArgs = @(
-            "-S", "ladybird",
-            "-B", $buildPath,
-            "-G", "Ninja",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_C_COMPILER=clang-cl",
-            "-DCMAKE_CXX_COMPILER=clang-cl",
-            "-DCMAKE_LINKER=lld-link",
-            "-DCMAKE_MAKE_PROGRAM=ninja",
-            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
-            "-DVCPKG_ROOT=$vcpkgRoot",
-            "-DVCPKG_TARGET_TRIPLET=x64-windows",
-            "-DVCPKG_OVERLAY_PORTS=$overlayPorts",
-            "-DVCPKG_OVERLAY_TRIPLETS=$overlayTriplets",
-            "-DLADYBIRD_BASELINE_CPU_TARGET=ON"
-          )
+          $overlayPorts = Join-Path $root "ladybird/Meta/CMake/vcpkg/overlay-ports"
+          $overlayTriplets = Join-Path $root "ladybird/Meta/CMake/vcpkg/release-triplets"
 
-          & cmake @cmakeArgs 2>&1 |
-            Tee-Object -FilePath "logs/cmake-configure.log"
+          if (-not (Test-Path $toolchain)) {
+            throw "vcpkg toolchain not found: $toolchain"
+          }
+
+          if (-not (Test-Path $overlayPorts)) {
+            throw "Ladybird overlay ports directory not found: $overlayPorts"
+          }
+
+          if (-not (Test-Path $overlayTriplets)) {
+            throw "Ladybird release triplets directory not found: $overlayTriplets"
+          }
+
+          New-Item -ItemType Directory -Force -Path $env:BUILD_DIR |
+            Out-Null
+
+          cmake -S ladybird -B $env:BUILD_DIR -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_MAKE_PROGRAM="$(Get-Command ninja).Source" `
+            -DCMAKE_C_COMPILER="C:/LLVM/bin/clang-cl.exe" `
+            -DCMAKE_CXX_COMPILER="C:/LLVM/bin/clang-cl.exe" `
+            -DCMAKE_LINKER="C:/LLVM/bin/lld-link.exe" `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DVCPKG_ROOT="$vcpkg" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DVCPKG_OVERLAY_PORTS="$overlayPorts" `
+            -DVCPKG_OVERLAY_TRIPLETS="$overlayTriplets" `
+            -DLADYBIRD_BASELINE_CPU_TARGET=ON
 
           if ($LASTEXITCODE -ne 0) {
             throw "CMake configure failed."
@@ -235,13 +251,15 @@ jobs:
       - name: Validate CMake configuration
         shell: pwsh
         run: |
-          $cacheFile = "ladybird/Build/release/CMakeCache.txt"
+          $ErrorActionPreference = "Stop"
 
-          if (-not (Test-Path $cacheFile)) {
-            throw "CMakeCache.txt not found."
+          $cache = Join-Path $env:BUILD_DIR "CMakeCache.txt"
+
+          if (-not (Test-Path $cache)) {
+            throw "CMakeCache.txt was not generated."
           }
 
-          $lines = Get-Content $cacheFile
+          $lines = Get-Content $cache
 
           function Get-CMakeCacheValue {
             param([string]$Name)
@@ -259,459 +277,332 @@ jobs:
             return ($line -replace '^.*?=', '')
           }
 
-          $checks = @{
-            "CMAKE_TOOLCHAIN_FILE" = ".vcpkg-upstream/scripts/buildsystems/vcpkg.cmake"
-            "VCPKG_TARGET_TRIPLET" = "x64-windows"
-            "CMAKE_GENERATOR" = "Ninja"
-          }
+          $checks = @(
+            "CMAKE_TOOLCHAIN_FILE",
+            "Z_VCPKG_ROOT_DIR",
+            "VCPKG_MANIFEST_DIR",
+            "VCPKG_TARGET_TRIPLET",
+            "VCPKG_OVERLAY_PORTS",
+            "VCPKG_OVERLAY_TRIPLETS",
+            "CMAKE_GENERATOR",
+            "CMAKE_BUILD_TYPE"
+          )
 
-          foreach ($key in $checks.Keys) {
-            $value = Get-CMakeCacheValue $key
+          foreach ($name in $checks) {
+            $value = Get-CMakeCacheValue $name
+
+            Write-Host "$name = $value"
 
             if ([string]::IsNullOrWhiteSpace($value)) {
-              throw "Missing CMake cache entry: $key"
+              throw "Required CMake cache entry is missing: $name"
             }
-
-            Write-Host "$key = $value"
           }
 
-          $compiler = Get-CMakeCacheValue "CMAKE_CXX_COMPILER"
+          $triplet = Get-CMakeCacheValue "VCPKG_TARGET_TRIPLET"
 
-          if ($compiler -notmatch "clang-cl") {
-            throw "Unexpected C++ compiler: $compiler"
+          if ($triplet -ne "x64-windows") {
+            throw "Unexpected vcpkg triplet: $triplet"
           }
 
-          Write-Host "CMake configuration validation passed."
+          Write-Host "`nCMake configuration validation completed."
 
       - name: Build Ladybird
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $jobs = [Environment]::ProcessorCount
-          Write-Host "Building with $jobs parallel jobs."
+          $log = Join-Path $env:RUNNER_TEMP "ladybird-build.log"
 
-          cmake --build "$env:BUILD_DIR" --parallel $jobs 2>&1 |
-            Tee-Object -FilePath "logs/build.log"
+          cmake --build $env:BUILD_DIR `
+            --parallel $env:NUMBER_OF_PROCESSORS 2>&1 |
+            Tee-Object -FilePath $log
 
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird build failed."
           }
 
-      - name: Locate build outputs
-        id: outputs
+      - name: Diagnose ICU data files
+        if: always()
         shell: pwsh
         run: |
-          $buildBin = "ladybird/Build/release/bin"
+          $ErrorActionPreference = "Continue"
 
-          if (-not (Test-Path $buildBin -PathType Container)) {
-            throw "Build output directory not found: $buildBin"
+          Write-Host "=== ICU files in Build/release ==="
+
+          $buildIcu = Join-Path $env:BUILD_DIR "share/Lagom/icu"
+
+          if (Test-Path $buildIcu) {
+            Get-ChildItem $buildIcu -File -Recurse |
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
+          }
+          else {
+            Write-Host "Build ICU directory does not exist: $buildIcu"
           }
 
-          $mainExe = Get-ChildItem $buildBin `
-            -Filter "Ladybird.exe" -File -Recurse |
-            Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "`n=== ICU files in vcpkg ==="
 
-          if (-not $mainExe) {
-            throw "Ladybird.exe was not produced."
-          }
+          $vcpkgInstalled = Join-Path $env:VCPKG_ROOT "installed"
 
-          "build_bin=$buildBin" >> $env:GITHUB_OUTPUT
-          "main_exe=$mainExe" >> $env:GITHUB_OUTPUT
-
-          Write-Host "Main executable: $mainExe"
-
-          Get-ChildItem $buildBin -File -Recurse |
-            Sort-Object Length -Descending |
-            Select-Object -First 40 FullName,
-              @{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB, 2)}} |
-            Format-Table -AutoSize
-
-      - name: Find Qt deployment tool
-        id: qt
-        shell: pwsh
-        run: |
-          $roots = @(
-            "ladybird/Build/release/vcpkg_installed",
-            ".vcpkg-upstream/installed"
-          )
-
-          $windeployqt = $null
-
-          foreach ($root in $roots) {
-            if (-not (Test-Path $root -PathType Container)) {
-              Write-Host "Skipping missing Qt search root: $root"
-              continue
-            }
-
-            $candidate = Get-ChildItem $root `
-              -Filter "windeployqt.exe" -File -Recurse `
+          if (Test-Path $vcpkgInstalled) {
+            Get-ChildItem $vcpkgInstalled `
+              -Filter "icudt*.dat" -File -Recurse `
               -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-
-            if ($candidate) {
-              $windeployqt = $candidate.FullName
-              break
-            }
+              Select-Object FullName, Length |
+              Format-Table -AutoSize
           }
 
-          if (-not $windeployqt) {
-            throw "windeployqt.exe was not found."
+          Write-Host "`n=== ICU CMake cache entries ==="
+
+          $cache = Join-Path $env:BUILD_DIR "CMakeCache.txt"
+
+          if (Test-Path $cache) {
+            Select-String -Path $cache `
+              -Pattern "ICU|LADYBIRD_ICU_DATA_FILE"
           }
 
-          $qtBin = Split-Path $windeployqt -Parent
-
-          "windeployqt=$windeployqt" >> $env:GITHUB_OUTPUT
-          "qt_bin=$qtBin" >> $env:GITHUB_OUTPUT
-
-          Write-Host "windeployqt: $windeployqt"
-          Write-Host "Qt bin: $qtBin"
-
-      - name: Create portable runtime directory
-        shell: pwsh
-        run: |
-          $package = "dist/Ladybird-Windows-x64"
-          $bin = Join-Path $package "bin"
-          $sourceBin = "ladybird/Build/release/bin"
-
-          Remove-Item $package -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $bin | Out-Null
-
-          # Copy all build executables, preserving relative paths.
-          Get-ChildItem $sourceBin -Filter "*.exe" -File -Recurse |
-            ForEach-Object {
-              $relative = $_.FullName.Substring(
-                (Resolve-Path $sourceBin).Path.Length
-              ).TrimStart('\')
-
-              $destination = Join-Path $bin $relative
-              $destinationDir = Split-Path $destination -Parent
-
-              New-Item -ItemType Directory -Force -Path $destinationDir |
-                Out-Null
-
-              Copy-Item $_.FullName $destination -Force
-              Write-Host "EXE: $relative"
-            }
-
-          # Copy DLLs emitted in the build output tree.
-          Get-ChildItem $sourceBin -Filter "*.dll" -File -Recurse |
-            ForEach-Object {
-              $relative = $_.FullName.Substring(
-                (Resolve-Path $sourceBin).Path.Length
-              ).TrimStart('\')
-
-              $destination = Join-Path $bin $relative
-              $destinationDir = Split-Path $destination -Parent
-
-              New-Item -ItemType Directory -Force -Path $destinationDir |
-                Out-Null
-
-              Copy-Item $_.FullName $destination -Force
-              Write-Host "DLL: $relative"
-            }
-
-          if (-not (Test-Path "$bin/Ladybird.exe")) {
-            $found = Get-ChildItem $bin -Filter "Ladybird.exe" -File -Recurse |
-              Select-Object -First 1
-
-            if (-not $found) {
-              throw "Ladybird.exe missing from runtime staging directory."
-            }
-
-            Copy-Item $found.FullName "$bin/Ladybird.exe" -Force
-          }
-
-      - name: Deploy Qt runtime and plugins
-        shell: pwsh
-        run: |
-          $packageBin = "dist/Ladybird-Windows-x64/bin"
-          $mainExe = Join-Path $packageBin "Ladybird.exe"
-          $windeployqt = "${{ steps.qt.outputs.windeployqt }}"
-
-          & $windeployqt `
-            --release `
-            --compiler-runtime `
-            --no-translations `
-            --dir $packageBin `
-            $mainExe 2>&1 |
-            Tee-Object -FilePath "logs/windeployqt.log"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "windeployqt failed."
-          }
-
-          if (-not (Test-Path "$packageBin/platforms/qwindows.dll")) {
-            throw "Qt Windows platform plugin platforms/qwindows.dll is missing."
-          }
-
-          Write-Host "Qt deployment completed."
-
-      - name: Collect non-system runtime DLL dependencies
+      - name: Prepare portable package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $packageBin = (Resolve-Path "dist/Ladybird-Windows-x64/bin").Path
-          $buildBin = "ladybird/Build/release/bin"
+          $buildRoot = (Resolve-Path $env:BUILD_DIR).Path
+          $sourceBin = Join-Path $buildRoot "bin"
+          $sourceShare = Join-Path $buildRoot "share/Lagom"
 
-          # Search only directories that actually exist.
-          $candidateRoots = @(
-            $buildBin,
-            "ladybird/Build/release/vcpkg_installed/x64-windows/bin",
-            "ladybird/Build/release/vcpkg_installed/x64-windows/debug/bin",
-            ".vcpkg-upstream/installed/x64-windows/bin",
-            ".vcpkg-upstream/installed/x64-windows/debug/bin",
-            "${{ steps.qt.outputs.qt_bin }}",
-            "$env:LLVM_ROOT/bin"
-          )
+          $packageRoot = Join-Path $root "dist/$env:PACKAGE_NAME"
+          $packageBin = Join-Path $packageRoot "bin"
+          $packageShare = Join-Path $packageRoot "share/Lagom"
 
-          $searchRoots = @()
+          $root = (Get-Location).Path
 
-          foreach ($path in $candidateRoots) {
-            if ([string]::IsNullOrWhiteSpace($path)) {
-              continue
-            }
-
-            if (Test-Path $path -PathType Container) {
-              $resolved = (Resolve-Path $path).Path
-
-              if ($searchRoots -notcontains $resolved) {
-                $searchRoots += $resolved
-                Write-Host "DLL search root: $resolved"
-              }
-            } else {
-              Write-Host "Skipping missing directory: $path"
-            }
+          if (-not (Test-Path $sourceBin)) {
+            throw "Build bin directory not found: $sourceBin"
           }
 
-          if ($searchRoots.Count -eq 0) {
-            throw "No DLL search directories were found."
+          if (-not (Test-Path $sourceShare)) {
+            throw "Build share/Lagom directory not found: $sourceShare"
           }
 
-          $systemDlls = @(
-            "advapi32.dll", "comctl32.dll", "comdlg32.dll",
-            "gdi32.dll", "kernel32.dll", "kernelbase.dll",
-            "ole32.dll", "oleaut32.dll", "shell32.dll",
-            "user32.dll", "ws2_32.dll", "winmm.dll",
-            "version.dll", "crypt32.dll", "bcrypt.dll",
-            "ntdll.dll", "shlwapi.dll", "imm32.dll",
-            "setupapi.dll", "iphlpapi.dll", "dnsapi.dll",
-            "dwmapi.dll", "uxtheme.dll", "rpcrt4.dll",
-            "sechost.dll"
-          )
-
-          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
-
-          $copied = @{}
-
-          Get-ChildItem $packageBin -Filter "*.dll" -File -Recurse |
-            ForEach-Object {
-              $copied[$_.Name.ToLowerInvariant()] = $true
-            }
-
-          $queue = [System.Collections.Generic.Queue[string]]::new()
-
-          Get-ChildItem $packageBin -File -Recurse |
-            Where-Object {
-              $_.Extension -in @(".exe", ".dll")
-            } |
-            ForEach-Object {
-              $queue.Enqueue($_.FullName)
-            }
-
-          $scanned = @{}
-
-          while ($queue.Count -gt 0) {
-            $file = $queue.Dequeue()
-            $fileKey = $file.ToLowerInvariant()
-
-            if ($scanned.ContainsKey($fileKey)) {
-              continue
-            }
-
-            $scanned[$fileKey] = $true
-
-            Write-Host "Scanning: $file"
-
-            $output = & $dumpbin /nologo /dependents $file 2>$null
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Could not inspect dependencies: $file"
-              continue
-            }
-
-            $dependencies = @(
-              foreach ($line in $output) {
-                if ($line -match '^\s+([A-Za-z0-9_.+-]+\.dll)\s*$') {
-                  $Matches[1]
-                }
-              }
-            ) | Select-Object -Unique
-
-            foreach ($dependency in $dependencies) {
-              $lower = $dependency.ToLowerInvariant()
-
-              if ($copied.ContainsKey($lower)) {
-                continue
-              }
-
-              if ($systemDlls -contains $lower) {
-                continue
-              }
-
-              if ($lower.StartsWith("api-ms-win-") -or
-                  $lower.StartsWith("ext-ms-win-")) {
-                continue
-              }
-
-              $found = $null
-
-              foreach ($root in $searchRoots) {
-                $candidate = Join-Path $root $dependency
-
-                if (Test-Path $candidate -PathType Leaf) {
-                  $found = $candidate
-                  break
-                }
-              }
-
-              if (-not $found) {
-                Write-Warning "Unresolved DLL: $dependency (referenced by $file)"
-                continue
-              }
-
-              $destination = Join-Path $packageBin $dependency
-
-              Copy-Item $found $destination -Force
-
-              $copied[$lower] = $true
-              $queue.Enqueue($destination)
-
-              Write-Host "Collected dependency: $dependency"
-            }
+          if (Test-Path "dist") {
+            Remove-Item "dist" -Recurse -Force
           }
 
-          $dllCount = (
-            Get-ChildItem $packageBin -Filter "*.dll" -File -Recurse
-          ).Count
-
-          Write-Host "DLL dependency scan completed."
-          Write-Host "Total packaged DLLs: $dllCount"
-
-      - name: Copy Ladybird runtime resources
-        shell: pwsh
-        run: |
-          $package = "dist/Ladybird-Windows-x64"
-          $resourceRoot = Join-Path $package "ladybird"
-
-          New-Item -ItemType Directory -Force -Path $resourceRoot |
+          New-Item -ItemType Directory -Force -Path $packageBin |
             Out-Null
 
-          $sourceResources = "ladybird/Base/res"
+          New-Item -ItemType Directory -Force -Path $packageShare |
+            Out-Null
 
-          if (-not (Test-Path $sourceResources -PathType Container)) {
-            throw "Ladybird resource directory not found: $sourceResources"
+          Write-Host "Copying runtime binaries and DLLs..."
+
+          Get-ChildItem $sourceBin -File | ForEach-Object {
+            $name = $_.Name
+
+            if ($name -match '^(Test.*|test-.*)\.exe$') {
+              Write-Host "Excluded test executable: $name"
+              return
+            }
+
+            Copy-Item $_.FullName $packageBin -Force
           }
 
-          New-Item -ItemType Directory -Force `
-            -Path "$resourceRoot/Base" | Out-Null
+          Write-Host "Copying Qt plugin directories..."
 
-          Copy-Item $sourceResources `
-            "$resourceRoot/Base/res" -Recurse -Force
+          $pluginDirs = @(
+            "platforms",
+            "imageformats",
+            "generic",
+            "networkinformation",
+            "position",
+            "styles",
+            "tls"
+          )
 
-          @"
-          Ladybird upstream commit: $env:LADYBIRD_COMMIT
-          Ladybird short commit: $env:LADYBIRD_SHORT_COMMIT
-          Built by: $env:GITHUB_REPOSITORY
-          Workflow run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
-          "@ | Set-Content "$package/BUILD-INFO.txt" -Encoding UTF8
+          foreach ($name in $pluginDirs) {
+            $source = Join-Path $sourceBin $name
 
-          @'
-          @echo off
-          setlocal
-          set "ROOT=%~dp0"
-          set "LADYBIRD_SOURCE_DIR=%ROOT%ladybird"
-          start "" "%ROOT%bin\Ladybird.exe" %*
-          '@ | Set-Content "$package/Start-Ladybird.bat" -Encoding ASCII
+            if (Test-Path $source -PathType Container) {
+              Copy-Item $source $packageBin -Recurse -Force
+              Write-Host "Copied Qt plugin directory: $name"
+            }
+          }
+
+          Write-Host "Copying Lagom resources..."
+
+          Copy-Item "$sourceShare/*" $packageShare -Recurse -Force
+
+          Write-Host "Portable package staging completed."
 
       - name: Validate portable package
         shell: pwsh
         run: |
-          $package = "dist/Ladybird-Windows-x64"
-          $bin = Join-Path $package "bin"
+          $ErrorActionPreference = "Stop"
 
-          $required = @(
-            "$bin/Ladybird.exe",
-            "$bin/platforms/qwindows.dll",
-            "$package/ladybird/Base/res"
+          $package = "dist/$env:PACKAGE_NAME"
+          $bin = Join-Path $package "bin"
+          $share = Join-Path $package "share/Lagom"
+
+          $requiredFiles = @(
+            "Ladybird.exe",
+            "WebContent.exe",
+            "Compositor.exe",
+            "ImageDecoder.exe",
+            "RequestServer.exe"
           )
 
-          foreach ($path in $required) {
-            if (-not (Test-Path $path)) {
-              throw "Required runtime component missing: $path"
+          foreach ($name in $requiredFiles) {
+            $path = Join-Path $bin $name
+
+            if (-not (Test-Path $path -PathType Leaf)) {
+              throw "Required runtime executable missing: $path"
             }
 
-            Write-Host "OK: $path"
+            Write-Host "Verified executable: $name"
           }
 
-          $exeCount = (
-            Get-ChildItem $bin -Filter "*.exe" -File -Recurse
-          ).Count
+          $requiredResources = @(
+            "fonts",
+            "icons",
+            "themes",
+            "ladybird"
+          )
 
-          $dllCount = (
-            Get-ChildItem $bin -Filter "*.dll" -File -Recurse
-          ).Count
+          foreach ($name in $requiredResources) {
+            $path = Join-Path $share $name
 
-          if ($exeCount -lt 1) {
-            throw "No executable files found in package."
+            if (-not (Test-Path $path -PathType Container)) {
+              throw "Required resource directory missing: $path"
+            }
+
+            Write-Host "Verified resource directory: $name"
           }
 
-          if ($dllCount -lt 1) {
-            throw "No runtime DLLs found in package."
+          $qtPlatform = Join-Path $bin "platforms/qwindows.dll"
+
+          if (-not (Test-Path $qtPlatform)) {
+            throw "Qt Windows platform plugin is missing."
           }
 
-          $size = (
-            Get-ChildItem $package -File -Recurse |
-            Measure-Object Length -Sum
-          ).Sum
+          $icuDir = Join-Path $share "icu"
 
-          Write-Host "EXE count: $exeCount"
-          Write-Host "DLL count: $dllCount"
-          Write-Host "Package size: $([math]::Round($size / 1MB, 2)) MB"
+          $icuFiles = @()
 
-          Get-ChildItem $package -File -Recurse |
-            Sort-Object Length -Descending |
-            Select-Object -First 30 FullName,
-              @{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB, 2)}} |
-            Format-Table -AutoSize
+          if (Test-Path $icuDir) {
+            $icuFiles = @(
+              Get-ChildItem $icuDir -Filter "icudt*.dat" -File
+            )
+          }
+
+          if ($icuFiles.Count -eq 0) {
+            throw "ICU data file is missing from the portable package. Check the ICU diagnostic step."
+          }
+
+          foreach ($file in $icuFiles) {
+            Write-Host "Verified ICU data: $($file.Name)"
+          }
+
+          $pdfjs = Join-Path $share "ladybird/pdfjs"
+
+          if (-not (Test-Path $pdfjs)) {
+            Write-Warning "PDF.js resources not found in this build."
+          }
+
+          Write-Host "`n=== Package summary ==="
+
+          $files = Get-ChildItem $package -File -Recurse
+          $total = ($files | Measure-Object Length -Sum).Sum
+
+          Write-Host "File count: $($files.Count)"
+          Write-Host "Total size: $([math]::Round($total / 1MB, 2)) MB"
+
+      - name: Write build information
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = "dist/$env:PACKAGE_NAME"
+
+          $info = @"
+          Ladybird Windows x64
+          ====================
+
+          Upstream repository:
+          $env:UPSTREAM_REPO
+
+          Upstream commit:
+          $env:LADYBIRD_COMMIT
+
+          LLVM version:
+          $env:LLVM_VERSION
+
+          Build configuration:
+          Release
+
+          Architecture:
+          x86_64
+
+          CPU baseline:
+          x86-64-v2 requested through LADYBIRD_BASELINE_CPU_TARGET
+
+          Packaging:
+          Curated portable runtime
+
+          "@
+
+          Set-Content -Path "$package/BUILD-INFO.txt" `
+            -Value $info -Encoding UTF8
+
+      - name: Create launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = "dist/$env:PACKAGE_NAME"
+
+          $launcher = @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+
+          set "LADYBIRD_ICU_DATA=%~dp0share\Lagom\icu"
+
+          if not exist "%~dp0bin\Ladybird.exe" (
+              echo Ladybird.exe was not found.
+              pause
+              exit /b 1
+          )
+
+          start "" "%~dp0bin\Ladybird.exe" %*
+          '@
+
+          Set-Content -Path "$package/Start-Ladybird.bat" `
+            -Value $launcher -Encoding ASCII
 
       - name: Create ZIP and SHA256
         shell: pwsh
         run: |
-          $package = "dist/Ladybird-Windows-x64"
-          $zip = "dist/Ladybird-Windows-x64.zip"
+          $ErrorActionPreference = "Stop"
 
-          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          $package = "dist/$env:PACKAGE_NAME"
+          $zip = "dist/$env:PACKAGE_NAME.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
           Compress-Archive `
             -Path "$package/*" `
             -DestinationPath $zip `
             -CompressionLevel Optimal
 
-          if (-not (Test-Path $zip)) {
-            throw "ZIP file was not created."
-          }
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 
-          $hash = (
-            Get-FileHash $zip -Algorithm SHA256
-          ).Hash.ToLowerInvariant()
+          Set-Content "$zip.sha256" "$hash  $env:PACKAGE_NAME.zip"
 
-          "$hash  Ladybird-Windows-x64.zip" |
-            Set-Content "dist/Ladybird-Windows-x64.zip.sha256" -Encoding ASCII
-
-          Write-Host "ZIP size: $([math]::Round((Get-Item $zip).Length / 1MB, 2)) MB"
+          Write-Host "ZIP: $zip"
           Write-Host "SHA256: $hash"
+          Write-Host "ZIP size: $([math]::Round((Get-Item $zip).Length / 1MB, 2)) MB"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -722,67 +613,65 @@ jobs:
             dist/Ladybird-Windows-x64.zip.sha256
           if-no-files-found: error
           compression-level: 0
-          retention-days: 30
+          retention-days: 14
 
       - name: Publish GitHub Pre-release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ladybird-windows-${{ github.run_number }}-${{ env.LADYBIRD_SHORT_COMMIT }}
-          name: Ladybird Windows x64 - ${{ env.LADYBIRD_SHORT_COMMIT }}
+          tag_name: ladybird-windows-${{ github.run_number }}
+          name: Ladybird Windows x64 Build ${{ github.run_number }}
           prerelease: true
-          draft: false
           generate_release_notes: true
           files: |
             dist/Ladybird-Windows-x64.zip
             dist/Ladybird-Windows-x64.zip.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Collect diagnostic logs on failure
+      - name: Collect failure diagnostics
         if: failure()
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path failure-diagnostics |
-            Out-Null
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=== Build logs ==="
 
           $paths = @(
-            "logs",
-            "ladybird/Build/release/CMakeCache.txt",
-            "ladybird/Build/release/CMakeFiles/CMakeConfigureLog.yaml",
+            "ladybird/Build/release/vcpkg-manifest-install.log",
+            "ladybird/Build/release/CMakeFiles/CMakeError.log",
+            "ladybird/Build/release/CMakeFiles/CMakeOutput.log",
             ".vcpkg-upstream/buildtrees"
           )
 
+          New-Item -ItemType Directory -Force `
+            -Path "diagnostics" | Out-Null
+
           foreach ($path in $paths) {
-            if (-not (Test-Path $path)) {
-              continue
+            if (Test-Path $path) {
+              if ((Get-Item $path).PSIsContainer) {
+                Get-ChildItem $path -Recurse -File `
+                  -Include "*out.log","*err.log","config.log","meson-log.txt" |
+                  ForEach-Object {
+                    $target = Join-Path "diagnostics" $_.Name
+                    Copy-Item $_.FullName $target -Force
+                  }
+              }
+              else {
+                Copy-Item $path "diagnostics" -Force
+              }
             }
+          }
 
-            $name = $path -replace '[:\\/]', '_'
-            $destination = Join-Path "failure-diagnostics" $name
-
-            if (Test-Path $path -PathType Container) {
-              New-Item -ItemType Directory -Force -Path $destination |
-                Out-Null
-
-              Get-ChildItem $path -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object {
-                  $_.Name -match 'out\.log|err\.log|config\.log|meson-log\.txt|CMakeCache\.txt|build\.log'
-                } |
-                ForEach-Object {
-                  $target = Join-Path $destination $_.Name
-                  Copy-Item $_.FullName $target -Force -ErrorAction SilentlyContinue
-                }
-            } else {
-              Copy-Item $path $destination -Force -ErrorAction SilentlyContinue
-            }
+          if (Test-Path "diagnostics") {
+            Get-ChildItem diagnostics -File |
+              Select-Object Name, Length |
+              Format-Table -AutoSize
           }
 
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Ladybird-Windows-failure-diagnostics
-          path: failure-diagnostics
+          name: Ladybird-Windows-Diagnostics
+          path: diagnostics/
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
