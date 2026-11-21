@@ -1,4 +1,5 @@
 name: Build Ladybird Windows x64
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,13 +13,16 @@ on:
         required: true
         default: false
         type: boolean
+
 permissions:
   contents: write
+
 jobs:
   build:
     name: Windows x64 Release
     runs-on: windows-2025
     timeout-minutes: 360
+
     env:
       PACKAGE_NAME: Ladybird-Windows-x64
       LLVM_VERSION: "22.1.8"
@@ -26,6 +30,7 @@ jobs:
       VCPKG_DISABLE_METRICS: 1
       RUSTFLAGS: "-A deprecated"
       CMAKE_BUILD_PARALLEL_LEVEL: 4
+
     steps:
       # --------------------------------------------------
       # 1. Checkout packaging repository
@@ -34,6 +39,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
       # --------------------------------------------------
       # 2. Install Python
       # --------------------------------------------------
@@ -41,6 +47,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       # --------------------------------------------------
       # 3. Setup MSVC x64
       # --------------------------------------------------
@@ -48,42 +55,148 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
       # --------------------------------------------------
       # 4. Setup Rust
       # --------------------------------------------------
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
       - name: Verify Rust
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           rustc --version
           cargo --version
+
           if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) {
             throw "Rust compiler not found."
           }
+
       # --------------------------------------------------
-      # 5. Install LLVM and build tools
+      # 5. Install LLVM 22.1.8 and build tools
       # --------------------------------------------------
       - name: Install LLVM and build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          choco install llvm ninja nasm pkgconfiglite -y --no-progress
+
+          Write-Host "Installing LLVM $env:LLVM_VERSION..."
+
+          choco install llvm `
+            --version=$env:LLVM_VERSION `
+            --allow-downgrade `
+            -y `
+            --no-progress
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Chocolatey installation failed."
+            throw "LLVM $env:LLVM_VERSION installation failed."
           }
+
+          choco install ninja nasm pkgconfiglite -y --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build tools installation failed."
+          }
+
           python -m pip install --upgrade pip cmake
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python build tools installation failed."
+          }
+
+          # Explicit LLVM installation path.
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          $clangCl = Join-Path $llvmBin "clang-cl.exe"
+
+          if (!(Test-Path $clangCl)) {
+            throw "LLVM clang-cl.exe not found: $clangCl"
+          }
+
+          # Put LLVM 22 before any preinstalled LLVM version.
+          $env:PATH = "$llvmBin;$env:PATH"
+
+          # Persist for all subsequent GitHub Actions steps.
+          $llvmBin | Out-File `
+            -FilePath $env:GITHUB_PATH `
+            -Encoding utf8 `
+            -Append
+
+          "LLVM_BIN=$llvmBin" >> $env:GITHUB_ENV
+          "LLVM_CLANG_CL=$clangCl" >> $env:GITHUB_ENV
+
+          Write-Host "LLVM binary directory: $llvmBin"
+          Write-Host "LLVM compiler: $clangCl"
+
+          & $clangCl --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to execute LLVM clang-cl."
+          }
+
+      # --------------------------------------------------
+      # 5.1 Verify LLVM version and PATH priority
+      # --------------------------------------------------
+      - name: Verify LLVM 22.1.8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expectedVersion = $env:LLVM_VERSION
+          $expectedCompiler = Join-Path $env:LLVM_BIN "clang-cl.exe"
+
+          if (!(Test-Path $expectedCompiler)) {
+            throw "Expected compiler does not exist: $expectedCompiler"
+          }
+
+          $resolved = Get-Command clang-cl -ErrorAction Stop
+          $resolvedPath = [IO.Path]::GetFullPath($resolved.Source)
+          $expectedPath = [IO.Path]::GetFullPath($expectedCompiler)
+
+          Write-Host "Resolved clang-cl: $resolvedPath"
+          Write-Host "Expected clang-cl: $expectedPath"
+
+          if ($resolvedPath -ine $expectedPath) {
+            throw "PATH is resolving to the wrong clang-cl executable."
+          }
+
+          $versionOutput = (& $expectedCompiler --version 2>&1 | Out-String)
+
+          Write-Host $versionOutput
+
+          $match = [regex]::Match(
+            $versionOutput,
+            'clang version\s+(\d+\.\d+\.\d+)'
+          )
+
+          if (!$match.Success) {
+            throw "Unable to determine clang-cl version."
+          }
+
+          $actualVersion = $match.Groups[1].Value
+
+          if ($actualVersion -ne $expectedVersion) {
+            throw "Wrong LLVM version. Expected $expectedVersion, got $actualVersion."
+          }
+
+          Write-Host "LLVM version verification passed."
+
+      # --------------------------------------------------
+      # 5.2 Verify build tools
+      # --------------------------------------------------
       - name: Verify build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           python --version
           cmake --version
           ninja --version
-          clang-cl --version
+          & $env:LLVM_CLANG_CL --version
           rustc --version
           cl.exe
+
       # --------------------------------------------------
       # 6. Clone Ladybird source
       # --------------------------------------------------
@@ -91,37 +204,52 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
+
           git clone --filter=blob:none `
             https://github.com/LadybirdBrowser/ladybird.git $source
+
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird clone failed."
           }
+
           Push-Location $source
+
           try {
             git fetch origin "${{ inputs.ref }}" --tags
+
             if ($LASTEXITCODE -ne 0) {
               throw "Unable to fetch requested ref."
             }
+
             git checkout --detach FETCH_HEAD
+
             if ($LASTEXITCODE -ne 0) {
               throw "Unable to checkout requested ref."
             }
+
             git submodule update --init --recursive
+
             if ($LASTEXITCODE -ne 0) {
               throw "Submodule initialization failed."
             }
+
             $commit = git rev-parse HEAD
             $shortCommit = git rev-parse --short HEAD
+
             "LADYBIRD_COMMIT=$commit" >> $env:GITHUB_ENV
             "LADYBIRD_SHORT_COMMIT=$shortCommit" >> $env:GITHUB_ENV
+
             Write-Host "Requested ref: ${{ inputs.ref }}"
             Write-Host "Resolved commit: $commit"
+
             git log -1 --oneline
           }
           finally {
             Pop-Location
           }
+
       # --------------------------------------------------
       # 7. Prepare vcpkg from upstream baseline
       # --------------------------------------------------
@@ -129,29 +257,41 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
           $vcpkg = Join-Path $env:GITHUB_WORKSPACE ".vcpkg-upstream"
           $manifestPath = Join-Path $source "vcpkg.json"
+
           if (!(Test-Path $manifestPath)) {
             throw "Upstream vcpkg.json not found."
           }
+
           $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
           $baseline = $manifest.'builtin-baseline'
+
           if ([string]::IsNullOrWhiteSpace($baseline)) {
             throw "builtin-baseline missing from vcpkg.json."
           }
+
           Write-Host "vcpkg baseline: $baseline"
+
           git clone https://github.com/microsoft/vcpkg.git $vcpkg
+
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg clone failed."
           }
+
           Push-Location $vcpkg
+
           try {
             git checkout $baseline
+
             if ($LASTEXITCODE -ne 0) {
               throw "Unable to checkout vcpkg baseline."
             }
+
             .\bootstrap-vcpkg.bat -disableMetrics
+
             if ($LASTEXITCODE -ne 0) {
               throw "vcpkg bootstrap failed."
             }
@@ -159,7 +299,9 @@ jobs:
           finally {
             Pop-Location
           }
+
           "VCPKG_ROOT=$vcpkg" >> $env:GITHUB_ENV
+
       # --------------------------------------------------
       # 8. Clean previous build output
       # --------------------------------------------------
@@ -167,63 +309,94 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
           $build = Join-Path $source "Build\release"
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+
           if (Test-Path $build) {
             Remove-Item $build -Recurse -Force
           }
+
           if (Test-Path $dist) {
             Remove-Item $dist -Recurse -Force
           }
+
           New-Item -ItemType Directory -Force $dist | Out-Null
+
       # --------------------------------------------------
-      # 9. Configure Ladybird
+      # 9. Configure Ladybird with explicit LLVM 22.1.8
       # --------------------------------------------------
       - name: Configure Ladybird
         id: configure
         shell: pwsh
-        env:
-          CC: clang-cl
-          CXX: clang-cl
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
           $build = Join-Path $source "Build\release"
           $toolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
           $overlay = Join-Path $source "Meta\CMake\vcpkg\release-triplets"
+
+          $clangCl = $env:LLVM_CLANG_CL
+
           if (!(Test-Path $toolchain)) {
             throw "vcpkg toolchain file not found: $toolchain"
           }
+
           if (!(Test-Path $overlay)) {
             throw "Release triplet directory not found: $overlay"
           }
+
+          if (!(Test-Path $clangCl)) {
+            throw "LLVM compiler not found: $clangCl"
+          }
+
+          Write-Host "Using compiler: $clangCl"
+          Write-Host "Compiler version:"
+          & $clangCl --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to execute LLVM compiler."
+          }
+
+          $env:CC = $clangCl
+          $env:CXX = $clangCl
+
           cmake -S $source -B $build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_C_COMPILER:FILEPATH="$clangCl" `
+            -DCMAKE_CXX_COMPILER:FILEPATH="$clangCl" `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_ROOT="$env:VCPKG_ROOT" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DVCPKG_OVERLAY_TRIPLETS="$overlay" `
             -DLADYBIRD_BASELINE_CPU_TARGET=ON
+
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::CMake configuration failed. Collecting vcpkg diagnostic logs."
+
             $angleLogDir = Join-Path $env:VCPKG_ROOT "buildtrees\angle"
+
             $logs = @(
               (Join-Path $angleLogDir "install-x64-windows-rel-out.log"),
               (Join-Path $angleLogDir "install-x64-windows-rel-err.log")
             )
+
             foreach ($log in $logs) {
               Write-Host ""
               Write-Host "=================================================="
               Write-Host "ANGLE LOG: $log"
               Write-Host "=================================================="
+
               if (Test-Path $log) {
                 Write-Host "Log size: $((Get-Item $log).Length) bytes"
                 Write-Host "----- Last 250 lines -----"
+
                 Get-Content $log -Tail 250
+
                 Write-Host "----- Error matches -----"
+
                 Select-String -Path $log `
                   -Pattern "error:|fatal error|FAILED:|CMake Error|undefined reference|LNK[0-9]+|error C[0-9]+" `
                   -Context 3,5 |
@@ -236,47 +409,84 @@ jobs:
                 Write-Warning "Log file not found: $log"
               }
             }
+
             throw "CMake configuration failed. Check ANGLE logs above."
           }
+
       # --------------------------------------------------
-      # 10. Verify CMake configuration
+      # 10. Verify CMake configuration and compiler
       # --------------------------------------------------
       - name: Verify CMake configuration
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $cache = Join-Path $env:GITHUB_WORKSPACE "ladybird\Build\release\CMakeCache.txt"
+
           if (!(Test-Path $cache)) {
             throw "CMakeCache.txt not found."
           }
+
           $content = Get-Content $cache -Raw
+
           $required = @(
             "CMAKE_BUILD_TYPE:STRING=Release",
             "LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON"
           )
+
           foreach ($item in $required) {
             if ($content -notmatch [regex]::Escape($item)) {
               Write-Warning "CMake cache entry not found exactly: $item"
             }
           }
+
+          # Verify CMake actually selected LLVM 22.1.8.
+          $expectedCompiler = [IO.Path]::GetFullPath($env:LLVM_CLANG_CL)
+          $expectedCompiler = $expectedCompiler.Replace("\", "/")
+
+          foreach ($variable in @("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")) {
+            $pattern = "(?m)^" + [regex]::Escape($variable) + ":[^=]*=(.+)$"
+            $match = [regex]::Match($content, $pattern)
+
+            if (!$match.Success) {
+              throw "$variable was not found in CMakeCache.txt."
+            }
+
+            $actualCompiler = $match.Groups[1].Value.Trim().Replace("\", "/")
+
+            Write-Host "$variable = $actualCompiler"
+
+            if ($actualCompiler -ine $expectedCompiler) {
+              throw "$variable is not using the expected LLVM compiler. Expected: $expectedCompiler"
+            }
+          }
+
+          Write-Host "CMake compiler verification passed."
           Write-Host "CMake cache verification completed."
+
       # --------------------------------------------------
       # 11. Build Ladybird
       # --------------------------------------------------
       - name: Build Ladybird
         shell: pwsh
         env:
-          CC: clang-cl
-          CXX: clang-cl
+          CC: ${{ env.LLVM_CLANG_CL }}
+          CXX: ${{ env.LLVM_CLANG_CL }}
           RUSTFLAGS: "-A deprecated"
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
           $build = Join-Path $source "Build\release"
+
           Push-Location $source
+
           try {
             Write-Host "Building Ladybird Release..."
+            Write-Host "LLVM compiler: $env:LLVM_CLANG_CL"
+
             cmake --build $build --parallel 4
+
             if ($LASTEXITCODE -ne 0) {
               throw "Ladybird build failed with exit code $LASTEXITCODE."
             }
@@ -284,6 +494,7 @@ jobs:
           finally {
             Pop-Location
           }
+
       # --------------------------------------------------
       # 12. Verify main executable
       # --------------------------------------------------
@@ -291,30 +502,43 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $build = Join-Path $env:GITHUB_WORKSPACE "ladybird\Build\release"
+
           $exe = Get-ChildItem $build -Recurse -File -Filter "Ladybird.exe" |
             Select-Object -First 1
+
           if (!$exe) {
             throw "Ladybird.exe not found."
           }
+
           $bytes = [IO.File]::ReadAllBytes($exe.FullName)
+
           if ($bytes.Length -lt 256) {
             throw "Ladybird.exe is unexpectedly small."
           }
+
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
             throw "Invalid PE executable."
           }
+
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+
           if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45) {
             throw "Invalid PE signature."
           }
+
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+
           if ($machine -ne 0x8664) {
             throw "Executable is not AMD64."
           }
+
           Write-Host "Valid Windows x64 executable:"
           Write-Host $exe.FullName
+
           "LADYBIRD_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+
       # --------------------------------------------------
       # 13. Stage runtime package
       # --------------------------------------------------
@@ -322,25 +546,31 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $source = Join-Path $env:GITHUB_WORKSPACE "ladybird"
           $build = Join-Path $source "Build\release"
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $bin = Join-Path $package "bin"
+
           New-Item -ItemType Directory -Force $bin | Out-Null
+
           # Copy all top-level build binaries and runtime DLLs.
           Get-ChildItem $build -File |
             Where-Object {
               $_.Extension -in @(".exe", ".dll")
             } |
             Copy-Item -Destination $bin -Force
+
           # Copy executable and DLL files from nested build directories.
           # Preserve relative directory layout for generated runtime resources.
           $runtimeDirs = @(
             "bin",
             "libexec"
           )
+
           foreach ($dir in $runtimeDirs) {
             $path = Join-Path $build $dir
+
             if (Test-Path $path) {
               Get-ChildItem $path -File -Recurse |
                 Where-Object {
@@ -351,16 +581,21 @@ jobs:
                 }
             }
           }
+
           # Ensure main executable is in bin.
           Copy-Item $env:LADYBIRD_EXE -Destination $bin -Force
+
           # Copy vcpkg runtime DLLs.
           $vcpkgBin = Join-Path $build "vcpkg_installed\x64-windows\bin"
+
           if (Test-Path $vcpkgBin) {
             Get-ChildItem $vcpkgBin -Filter "*.dll" -File |
               Copy-Item -Destination $bin -Force
           }
+
           # Copy vcpkg Qt plugins.
           $installed = Join-Path $build "vcpkg_installed"
+
           if (Test-Path $installed) {
             $pluginDirs = @(
               "platforms",
@@ -369,64 +604,83 @@ jobs:
               "iconengines",
               "tls"
             )
+
             foreach ($pluginDir in $pluginDirs) {
               $matches = Get-ChildItem $installed -Directory -Recurse |
                 Where-Object { $_.Name -eq $pluginDir }
+
               foreach ($match in $matches) {
                 $target = Join-Path $bin $pluginDir
+
                 New-Item -ItemType Directory -Force $target | Out-Null
+
                 Get-ChildItem $match.FullName -File -Filter "*.dll" |
                   Copy-Item -Destination $target -Force
               }
             }
           }
+
           # Copy share and resource directories from build output.
           $resourceDirs = @(
             "share",
             "res",
             "resources"
           )
+
           foreach ($dir in $resourceDirs) {
             $path = Join-Path $build $dir
+
             if (Test-Path $path) {
               Copy-Item $path -Destination $package -Recurse -Force
             }
           }
+
           # Copy generated resource directories from source tree if present.
           $sourceResourceDirs = @(
             "Libraries",
             "Resources"
           )
+
           foreach ($dir in $sourceResourceDirs) {
             $path = Join-Path $source $dir
+
             if (Test-Path $path) {
               Write-Host "Source resource directory exists: $path"
             }
           }
+
           # Copy ICU data files when present.
           $icuFiles = Get-ChildItem $build -Recurse -File -Filter "*.dat" |
             Where-Object {
               $_.Name -match "icudt"
             }
+
           foreach ($file in $icuFiles) {
             Copy-Item $file.FullName -Destination $bin -Force
           }
+
           # Copy PDF.js resources when present.
           $pdfFiles = Get-ChildItem $build -Recurse -File |
             Where-Object {
               $_.FullName -match "pdf\.js|pdfjs"
             }
+
           foreach ($file in $pdfFiles) {
             $relative = $file.FullName.Substring($build.Length).TrimStart("\")
             $target = Join-Path $package $relative
             $targetDir = Split-Path $target -Parent
+
             New-Item -ItemType Directory -Force $targetDir | Out-Null
+
             Copy-Item $file.FullName -Destination $target -Force
           }
+
           if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
             throw "Ladybird.exe missing from staged package."
           }
+
           Write-Host "Runtime staging completed."
+
       # --------------------------------------------------
       # 14. Clean runtime package
       # --------------------------------------------------
@@ -434,16 +688,20 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $bin = Join-Path $package "bin"
+
           $testPatterns = @(
             '^Test.*\.exe$',
             '^test-.*\.exe$',
             '^test-js-debugger$',
             '^test-js\.py$'
           )
+
           Get-ChildItem $package -File -Recurse | ForEach-Object {
             $file = $_
+
             foreach ($pattern in $testPatterns) {
               if ($file.Name -match $pattern) {
                 Write-Host "Removing test artifact: $($file.FullName)"
@@ -452,6 +710,7 @@ jobs:
               }
             }
           }
+
           $forbiddenExtensions = @(
             ".obj",
             ".o",
@@ -467,6 +726,7 @@ jobs:
             ".recipe",
             ".lib"
           )
+
           Get-ChildItem $package -File -Recurse |
             Where-Object {
               $forbiddenExtensions -contains $_.Extension.ToLowerInvariant()
@@ -475,7 +735,9 @@ jobs:
               Write-Host "Removing build artifact: $($_.FullName)"
               Remove-Item $_.FullName -Force
             }
+
           Write-Host "Package cleanup completed."
+
       # --------------------------------------------------
       # 15. Create launcher
       # --------------------------------------------------
@@ -483,8 +745,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $launcher = Join-Path $package "Start-Ladybird.bat"
+
           @'
           @echo off
           setlocal
@@ -492,6 +756,7 @@ jobs:
           Ladybird.exe %*
           exit /b %ERRORLEVEL%
           '@ | Set-Content -Path $launcher -Encoding ASCII
+
       # --------------------------------------------------
       # 16. Generate build information
       # --------------------------------------------------
@@ -499,7 +764,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
+
           $info = @"
           Product: Ladybird for Windows x64
           Source: https://github.com/LadybirdBrowser/ladybird
@@ -507,6 +774,7 @@ jobs:
           Commit: $env:LADYBIRD_COMMIT
           Build type: Release
           Compiler: LLVM $env:LLVM_VERSION clang-cl
+          Compiler path: $env:LLVM_CLANG_CL
           Toolchain: MSVC x64
           Rust: $(rustc --version)
           Python: $(python --version)
@@ -520,7 +788,9 @@ jobs:
           - Keep the bin and share directories together.
           - Runtime stability has not been certified by this workflow.
           "@
+
           $info | Set-Content (Join-Path $package "BUILD-INFO.txt") -Encoding UTF8
+
       # --------------------------------------------------
       # 17. Verify package contents
       # --------------------------------------------------
@@ -528,42 +798,57 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $bin = Join-Path $package "bin"
+
           $required = @(
             (Join-Path $bin "Ladybird.exe"),
             (Join-Path $package "Start-Ladybird.bat"),
             (Join-Path $package "BUILD-INFO.txt")
           )
+
           foreach ($file in $required) {
             if (!(Test-Path $file)) {
               throw "Required package file missing: $file"
             }
           }
+
           $files = Get-ChildItem $package -Recurse -File
+
           if ($files.Count -lt 50) {
             throw "Package contains unexpectedly few files: $($files.Count)"
           }
+
           $dllCount = ($files | Where-Object Extension -eq ".dll").Count
           $exeCount = ($files | Where-Object Extension -eq ".exe").Count
+
           Write-Host "Package files: $($files.Count)"
           Write-Host "EXE files: $exeCount"
           Write-Host "DLL files: $dllCount"
+
           if ($dllCount -eq 0) {
             throw "No runtime DLL files found."
           }
+
           if ($exeCount -lt 2) {
             throw "Expected main and helper executables."
           }
+
           $qwindows = Get-ChildItem $bin -Recurse -File -Filter "qwindows.dll"
+
           if (!$qwindows) {
             throw "Qt Windows platform plugin qwindows.dll missing."
           }
+
           $qtCore = Get-ChildItem $bin -File -Filter "Qt6Core.dll"
+
           if (!$qtCore) {
             throw "Qt6Core.dll missing."
           }
+
           Write-Host "Runtime package verification passed."
+
       # --------------------------------------------------
       # 18. Generate inventory
       # --------------------------------------------------
@@ -571,8 +856,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $inventory = Join-Path $package "PACKAGE-INVENTORY.txt"
+
           Get-ChildItem $package -Recurse -File |
             Sort-Object FullName |
             ForEach-Object {
@@ -580,6 +867,7 @@ jobs:
               "{0}`t{1}" -f $relative, $_.Length
             } |
             Set-Content $inventory -Encoding UTF8
+
       # --------------------------------------------------
       # 19. Generate dependency report
       # --------------------------------------------------
@@ -587,25 +875,34 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $bin = Join-Path $package "bin"
           $report = Join-Path $package "DEPENDENCY-REPORT.txt"
+
           "Ladybird Windows x64 dependency report" |
             Set-Content $report -Encoding UTF8
+
           Get-ChildItem $bin -File -Filter "*.exe" |
             ForEach-Object {
               Add-Content $report "`n========================================"
               Add-Content $report "Executable: $($_.Name)"
+
               $output = & dumpbin /dependents $_.FullName 2>&1
+
               Add-Content $report ($output | Out-String)
             }
+
           Get-ChildItem $bin -File -Filter "*.dll" |
             ForEach-Object {
               Add-Content $report "`n========================================"
               Add-Content $report "DLL: $($_.Name)"
+
               $output = & dumpbin /dependents $_.FullName 2>&1
+
               Add-Content $report ($output | Out-String)
             }
+
       # --------------------------------------------------
       # 20. Create ZIP
       # --------------------------------------------------
@@ -613,21 +910,29 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $package = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME"
           $zip = Join-Path $env:GITHUB_WORKSPACE "$env:PACKAGE_NAME.zip"
+
           if (Test-Path $zip) {
             Remove-Item $zip -Force
           }
+
           Compress-Archive `
             -Path (Join-Path $package "*") `
             -DestinationPath $zip `
             -CompressionLevel Optimal
+
           if (!(Test-Path $zip)) {
             throw "ZIP creation failed."
           }
+
           $file = Get-Item $zip
+
           Write-Host "ZIP size: $([math]::Round($file.Length / 1MB, 2)) MB"
+
           "ZIP_PATH=$zip" >> $env:GITHUB_ENV
+
       # --------------------------------------------------
       # 21. Verify ZIP integrity
       # --------------------------------------------------
@@ -635,26 +940,35 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $zip = Join-Path $env:GITHUB_WORKSPACE "$env:PACKAGE_NAME.zip"
+
           Add-Type -AssemblyName System.IO.Compression.FileSystem
+
           $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+
           try {
             if ($archive.Entries.Count -lt 50) {
               throw "ZIP contains too few entries."
             }
+
             $names = $archive.Entries.FullName
+
             if ($names -notcontains "bin/Ladybird.exe") {
               throw "Ladybird.exe missing from ZIP."
             }
+
             if ($names -notcontains "Start-Ladybird.bat") {
               throw "Launcher missing from ZIP."
             }
+
             Write-Host "ZIP entries: $($archive.Entries.Count)"
             Write-Host "ZIP integrity check passed."
           }
           finally {
             $archive.Dispose()
           }
+
       # --------------------------------------------------
       # 22. SHA256
       # --------------------------------------------------
@@ -662,11 +976,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $zip = Join-Path $env:GITHUB_WORKSPACE "$env:PACKAGE_NAME.zip"
+
           $hash = Get-FileHash $zip -Algorithm SHA256
           $hashText = "$($hash.Hash)  $env:PACKAGE_NAME.zip"
+
           $hashText | Set-Content "$zip.sha256" -Encoding ASCII
+
           Write-Host $hashText
+
       # --------------------------------------------------
       # 23. Upload build artifact
       # --------------------------------------------------
@@ -680,6 +999,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
       # --------------------------------------------------
       # 24. Upload audit reports
       # --------------------------------------------------
@@ -693,6 +1013,7 @@ jobs:
             dist/Ladybird-Windows-x64/DEPENDENCY-REPORT.txt
           if-no-files-found: error
           retention-days: 30
+
       # --------------------------------------------------
       # 25. Optional GitHub Release
       # --------------------------------------------------
@@ -702,6 +1023,7 @@ jobs:
         run: |
           $tag = "windows-${{ github.run_number }}-$env:LADYBIRD_SHORT_COMMIT"
           "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+
       - name: Publish GitHub Release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
