@@ -124,7 +124,6 @@ jobs:
 
       # ----------------------------------------------------------
       # 5. LLVM 22.1.8
-      # No llvm-actions/setup-llvm dependency.
       # ----------------------------------------------------------
       - name: Install LLVM 22.1.8
         shell: pwsh
@@ -171,7 +170,6 @@ jobs:
 
       # ----------------------------------------------------------
       # 6. MSVC
-      # Do not pin toolset 14.52.
       # ----------------------------------------------------------
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -214,7 +212,6 @@ jobs:
 
       # ----------------------------------------------------------
       # 7. Private vcpkg
-      # Never use Visual Studio VC\vcpkg as clone destination.
       # ----------------------------------------------------------
       - name: Setup private vcpkg
         shell: pwsh
@@ -371,7 +368,8 @@ jobs:
           "LADYBIRD_BUILD_DIR=$build" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       # ----------------------------------------------------------
-      # 9. Validate CMake cache
+      # 9. Validate CMake configuration
+      # Normalize Windows paths before comparing.
       # ----------------------------------------------------------
       - name: Validate CMake configuration
         shell: pwsh
@@ -390,6 +388,7 @@ jobs:
             param([string]$Name)
 
             $pattern = "^$([regex]::Escape($Name)):[^=]+=(.*)$"
+
             $line = $lines |
               Where-Object { $_ -match $pattern } |
               Select-Object -First 1
@@ -398,22 +397,32 @@ jobs:
               return $null
             }
 
-            return ($line -replace '^.*?=', '')
+            return ($line -replace '^.*?=', '').Trim()
+          }
+
+          function Normalize-PathValue {
+            param([string]$Value)
+
+            if ([string]::IsNullOrWhiteSpace($Value)) {
+              return ""
+            }
+
+            $normalized = $Value.Trim().Replace('\', '/')
+
+            while ($normalized.Contains('//')) {
+              $normalized = $normalized.Replace('//', '/')
+            }
+
+            return $normalized.TrimEnd('/').ToLowerInvariant()
           }
 
           $checks = @{
             "CMAKE_GENERATOR" = "Ninja"
             "CMAKE_BUILD_TYPE" = "Release"
-            "CMAKE_TOOLCHAIN_FILE" = $env:VCPKG_TOOLCHAIN
-            "VCPKG_ROOT" = $env:VCPKG_ROOT
           }
 
           foreach ($name in $checks.Keys) {
             $actual = Get-CMakeCacheValue $name
-
-            if ([string]::IsNullOrWhiteSpace($actual)) {
-              throw "Missing CMake cache value: $name"
-            }
 
             Write-Host "$name = $actual"
 
@@ -422,14 +431,40 @@ jobs:
             }
           }
 
+          $pathChecks = @{
+            "CMAKE_TOOLCHAIN_FILE" = $env:VCPKG_TOOLCHAIN
+            "VCPKG_ROOT" = $env:VCPKG_ROOT
+          }
+
+          foreach ($name in $pathChecks.Keys) {
+            $actual = Get-CMakeCacheValue $name
+            $expected = $pathChecks[$name]
+
+            Write-Host "$name (cache)    = $actual"
+            Write-Host "$name (expected) = $expected"
+
+            if ([string]::IsNullOrWhiteSpace($actual)) {
+              throw "CMake cache entry missing: $name"
+            }
+
+            $actualNormalized = Normalize-PathValue $actual
+            $expectedNormalized = Normalize-PathValue $expected
+
+            if ($actualNormalized -ne $expectedNormalized) {
+              throw "Unexpected CMake cache path: $name"
+            }
+          }
+
           $baseline = Get-CMakeCacheValue "LADYBIRD_BASELINE_CPU_TARGET"
 
           if ($null -ne $baseline) {
-            Write-Host "CPU baseline cache value: $baseline"
+            Write-Host "LADYBIRD_BASELINE_CPU_TARGET = $baseline"
           }
           else {
-            Write-Warning "CPU baseline option is not present in cache. It was passed to CMake, but source-level consumption is not verified."
+            Write-Warning "CPU baseline option is not present in CMakeCache. Its actual consumption by this source revision is not verified."
           }
+
+          Write-Host "CMake configuration validation passed."
 
       # ----------------------------------------------------------
       # 10. Build
@@ -476,7 +511,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
           New-Item -ItemType Directory -Force -Path $share | Out-Null
 
-          # Find Ladybird.exe.
           $mainExe = Get-ChildItem $build -Filter "Ladybird.exe" -File -Recurse |
             Select-Object -First 1
 
@@ -488,11 +522,9 @@ jobs:
 
           Write-Host "Runtime binary directory: $sourceBin"
 
-          # Copy files located beside Ladybird.exe.
           Get-ChildItem $sourceBin -File |
             Copy-Item -Destination $bin -Force
 
-          # Copy helper executable files from the build tree.
           $helperNames = @(
             "Compositor.exe",
             "Hub.exe",
@@ -516,7 +548,6 @@ jobs:
             }
           }
 
-          # Copy Qt plugins when present.
           $pluginDirs = @(
             "platforms",
             "imageformats",
@@ -535,7 +566,6 @@ jobs:
             }
           }
 
-          # Prefer a generated or installed share/Lagom directory.
           $shareCandidates = @(
             (Join-Path $build "share/Lagom"),
             (Join-Path $build "share/lagom")
@@ -552,8 +582,6 @@ jobs:
               Copy-Item -Destination $share -Recurse -Force
           }
           else {
-            # Fallback: stage source resources without assuming
-            # that this layout is identical to the installed layout.
             $sourceResources = Join-Path $workspace "ladybird/Base/res"
 
             if (!(Test-Path $sourceResources)) {
@@ -570,8 +598,7 @@ jobs:
               Copy-Item -Destination $resourceDestination -Recurse -Force
           }
 
-          # Find ICU data files. Copy if present; do not assume
-          # every ICU build uses the same external data packaging.
+          # Copy external ICU data when the build uses it.
           $icuRoots = @(
             $build,
             $env:VCPKG_ROOT
@@ -598,10 +625,9 @@ jobs:
             }
           }
           else {
-            Write-Warning "No external icudt*.dat found. ICU may be linked or packaged differently; runtime validation is still required."
+            Write-Warning "No external icudt*.dat found. ICU may be linked or packaged differently."
           }
 
-          # Launcher.
           $launcher = @'
           @echo off
           setlocal
@@ -614,7 +640,7 @@ jobs:
           Write-Host "Runtime staging completed."
 
       # ----------------------------------------------------------
-      # 12. Remove tests and build artifacts
+      # 12. Clean runtime package
       # ----------------------------------------------------------
       - name: Clean runtime package
         shell: pwsh
@@ -660,11 +686,10 @@ jobs:
               Remove-Item $_.FullName -Force
             }
 
-          Write-Host "Cleanup completed. Runtime DLLs were retained."
+          Write-Host "Cleanup completed. Runtime DLLs retained."
 
       # ----------------------------------------------------------
       # 13. Validate package
-      # Required helpers are checked only if produced by this build.
       # ----------------------------------------------------------
       - name: Validate runtime package
         shell: pwsh
@@ -675,14 +700,16 @@ jobs:
           $bin = Join-Path $package "bin"
           $share = Join-Path $package "share/Lagom"
 
-          $requiredExecutables = @(
-            "Ladybird.exe"
-          )
+          if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
+            throw "Ladybird.exe missing."
+          }
 
-          foreach ($name in $requiredExecutables) {
-            if (!(Test-Path (Join-Path $bin $name))) {
-              throw "Required executable missing: $name"
-            }
+          if (!(Test-Path $share)) {
+            throw "share/Lagom directory missing."
+          }
+
+          if (!(Test-Path (Join-Path $package "Start-Ladybird.bat"))) {
+            throw "Launcher missing."
           }
 
           $helperNames = @(
@@ -700,27 +727,15 @@ jobs:
           )
 
           foreach ($name in $helperNames) {
-            if (Test-Path (Join-Path $env:LADYBIRD_BUILD_DIR $name)) {
-              Write-Host "Build root contains helper: $name"
-            }
-
             if (Test-Path (Join-Path $bin $name)) {
               Write-Host "Packaged helper: $name"
             }
           }
 
-          if (!(Test-Path $share)) {
-            throw "share/Lagom directory missing."
-          }
-
-          if (!(Test-Path (Join-Path $package "Start-Ladybird.bat"))) {
-            throw "Launcher missing."
-          }
-
           $qtPlatform = Join-Path $bin "platforms/qwindows.dll"
 
           if (!(Test-Path $qtPlatform)) {
-            Write-Warning "Qt qwindows.dll not found. Verify Qt plugin deployment for this build."
+            Write-Warning "Qt qwindows.dll not found. Verify Qt plugin deployment."
           }
 
           $icuFiles = @(
@@ -732,7 +747,7 @@ jobs:
             $icuFiles | ForEach-Object { Write-Host $_.FullName }
           }
           else {
-            Write-Warning "No external ICU data file packaged. Confirm the ICU data mechanism used by this build."
+            Write-Warning "No external ICU data file packaged. Confirm the ICU data mechanism."
           }
 
           $pdfRoot = Join-Path $share "ladybird/pdfjs"
