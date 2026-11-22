@@ -32,6 +32,7 @@ jobs:
       PACKAGE_NAME: Ladybird-Windows-x64
       VCPKG_DEFAULT_TRIPLET: x64-windows
       VCPKG_DISABLE_METRICS: 1
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/vcpkg-binary-cache
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       RUSTFLAGS: "-A deprecated"
       BUILD_TYPE: Release
@@ -82,6 +83,10 @@ jobs:
 
           choco install llvm --version=22.1.8 --allow-downgrade -y
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "LLVM installation failed"
+          }
+
           $llvmBin = "C:\Program Files\LLVM\bin"
 
           if (!(Test-Path "$llvmBin\clang-cl.exe")) {
@@ -98,7 +103,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           choco install ninja cmake git 7zip -y
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build utilities installation failed"
+          }
 
       - name: Verify build tools
         shell: pwsh
@@ -140,6 +150,9 @@ jobs:
           if ($target -notmatch "x86_64.*windows.*msvc") {
             throw "Unexpected Clang target: $target"
           }
+
+          $clangVersion = (& clang-cl.exe --version | Out-String)
+          Write-Host $clangVersion
 
           $testFile = Join-Path $env:RUNNER_TEMP "clang-msvc-test.cpp"
 
@@ -202,7 +215,7 @@ jobs:
           Write-Host "Ladybird commit: $sourceSha"
 
       # ------------------------------------------------------------
-      # 4. Bootstrap vcpkg using Ladybird baseline
+      # 4. Read vcpkg baseline
       # ------------------------------------------------------------
       - name: Read vcpkg baseline
         shell: pwsh
@@ -222,6 +235,9 @@ jobs:
 
           Write-Host "Ladybird vcpkg baseline: $baseline"
 
+      # ------------------------------------------------------------
+      # 5. Checkout and bootstrap vcpkg
+      # ------------------------------------------------------------
       - name: Checkout and bootstrap vcpkg
         shell: pwsh
         run: |
@@ -256,7 +272,7 @@ jobs:
           .\vcpkg.exe version
 
       # ------------------------------------------------------------
-      # 5. Create dav1d overlay port and compatibility workaround
+      # 6. Create dav1d overlay port
       # ------------------------------------------------------------
       - name: Create dav1d MSVC compatibility overlay
         shell: pwsh
@@ -285,7 +301,7 @@ jobs:
           $mesonMarker = "vcpkg_configure_meson"
 
           if (!$content.Contains($mesonMarker)) {
-            throw "Could not find vcpkg_configure_meson in dav1d portfile. Overlay was not modified."
+            throw "Could not find vcpkg_configure_meson in dav1d portfile"
           }
 
           $patchCode = @'
@@ -343,12 +359,66 @@ jobs:
           Set-Content -Path $portfile -Value $content -Encoding utf8
 
           Write-Host "Created dav1d overlay port: $overlayPort"
-          Write-Host "Overlay patch injection verified."
 
           "VCPKG_OVERLAY_PORTS=$overlayRoot" >> $env:GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 6. Clean build directories
+      # 7. Create Release-only overlay triplet
+      # ------------------------------------------------------------
+      - name: Create Release-only vcpkg triplet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sourceTriplet = Join-Path $env:VCPKG_ROOT "triplets\x64-windows.cmake"
+          $overlayRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg-overlays\triplets"
+          $overlayTriplet = Join-Path $overlayRoot "x64-windows.cmake"
+
+          if (!(Test-Path $sourceTriplet)) {
+            throw "Built-in x64-windows triplet was not found"
+          }
+
+          New-Item -ItemType Directory -Force -Path $overlayRoot | Out-Null
+
+          Copy-Item $sourceTriplet $overlayTriplet -Force
+
+          $content = Get-Content $overlayTriplet -Raw
+
+          if ($content -notmatch 'VCPKG_BUILD_TYPE') {
+            Add-Content -Path $overlayTriplet -Value "`r`nset(VCPKG_BUILD_TYPE release)`r`n"
+          }
+
+          Write-Host "Release-only triplet:"
+          Get-Content $overlayTriplet
+
+          "VCPKG_OVERLAY_TRIPLETS=$overlayRoot" >> $env:GITHUB_ENV
+
+      # ------------------------------------------------------------
+      # 8. Restore vcpkg binary cache
+      # ------------------------------------------------------------
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-binary-cache
+          key: vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-msvc14.52-${{ hashFiles('ladybird/vcpkg.json', 'vcpkg-overlays/dav1d/portfile.cmake', 'vcpkg-overlays/triplets/x64-windows.cmake') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-msvc14.52-
+
+      - name: Initialize vcpkg binary cache
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force `
+            -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+
+          Write-Host "vcpkg binary cache: $env:VCPKG_DEFAULT_BINARY_CACHE"
+          Write-Host "Cache directory contents:"
+          Get-ChildItem $env:VCPKG_DEFAULT_BINARY_CACHE -Force |
+            Select-Object Name, Length
+
+      # ------------------------------------------------------------
+      # 9. Clean build directories
       # ------------------------------------------------------------
       - name: Clean build directories
         shell: pwsh
@@ -369,7 +439,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
       # ------------------------------------------------------------
-      # 7. Configure Ladybird
+      # 10. Configure Ladybird
       # ------------------------------------------------------------
       - name: Configure Ladybird
         shell: pwsh
@@ -390,6 +460,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DVCPKG_HOST_TRIPLET=x64-windows `
             "-DVCPKG_OVERLAY_PORTS=$env:VCPKG_OVERLAY_PORTS" `
+            "-DVCPKG_OVERLAY_TRIPLETS=$env:VCPKG_OVERLAY_TRIPLETS" `
             -DVCPKG_MANIFEST_MODE=ON `
             -DVCPKG_MANIFEST_INSTALL=ON `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
@@ -401,7 +472,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 8. Verify CMake cache - corrected type-independent check
+      # 11. Verify CMake cache
       # ------------------------------------------------------------
       - name: Verify CMake compiler and overlay settings
         shell: pwsh
@@ -441,11 +512,11 @@ jobs:
           Write-Host "vcpkg triplet: $triplet"
 
           if ([string]::IsNullOrWhiteSpace($cCompiler)) {
-            throw "CMAKE_C_COMPILER is missing from CMakeCache.txt"
+            throw "CMAKE_C_COMPILER is missing"
           }
 
           if ([string]::IsNullOrWhiteSpace($cxxCompiler)) {
-            throw "CMAKE_CXX_COMPILER is missing from CMakeCache.txt"
+            throw "CMAKE_CXX_COMPILER is missing"
           }
 
           if ($cCompiler -notmatch "clang-cl(\.exe)?$") {
@@ -463,7 +534,7 @@ jobs:
           Write-Host "CMake compiler and vcpkg configuration verified."
 
       # ------------------------------------------------------------
-      # 9. Build
+      # 12. Build Ladybird
       # ------------------------------------------------------------
       - name: Build Ladybird
         shell: pwsh
@@ -477,7 +548,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 10. Verify executable architecture
+      # 13. Verify executable architecture
       # ------------------------------------------------------------
       - name: Verify executable architecture
         shell: pwsh
@@ -485,8 +556,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $buildDir = (Resolve-Path "ladybird\Build\release").Path
-
-          $executables = Get-ChildItem $buildDir -Recurse -File -Filter "*.exe"
+          $executables = @(Get-ChildItem $buildDir -Recurse -File -Filter "*.exe")
 
           if ($executables.Count -eq 0) {
             throw "No executable files were produced"
@@ -521,7 +591,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 11. Stage runtime package
+      # 14. Stage runtime package
       # ------------------------------------------------------------
       - name: Stage runtime package
         shell: pwsh
@@ -585,7 +655,7 @@ jobs:
             Select-Object FullName, Length
 
       # ------------------------------------------------------------
-      # 12. Launcher and build information
+      # 15. Launcher and build information
       # ------------------------------------------------------------
       - name: Create launcher and build information
         shell: pwsh
@@ -624,11 +694,13 @@ jobs:
           Build timestamp UTC: $env:BUILD_TIMESTAMP
           vcpkg baseline: $env:VCPKG_BASELINE
           Compiler: clang-cl + MSVC STL
+          vcpkg build: Release-only
+          vcpkg binary cache: enabled
           dav1d workaround: a34e0685b9111b9eb1d7835ea7bea5b425dced73
           "@ | Set-Content "$stage\BUILD-INFO.txt" -Encoding utf8
 
       # ------------------------------------------------------------
-      # 13. Package audit
+      # 16. Package audit
       # ------------------------------------------------------------
       - name: Generate package inventory
         shell: pwsh
@@ -673,7 +745,7 @@ jobs:
             }
 
       # ------------------------------------------------------------
-      # 14. ZIP and checksum
+      # 17. ZIP and checksum
       # ------------------------------------------------------------
       - name: Create ZIP archive
         shell: pwsh
@@ -687,7 +759,9 @@ jobs:
             Remove-Item $zip -Force
           }
 
-          Compress-Archive -Path "$source\*" -DestinationPath $zip -CompressionLevel Optimal
+          Compress-Archive -Path "$source\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
 
           if (!(Test-Path $zip)) {
             throw "ZIP archive was not created"
@@ -722,7 +796,7 @@ jobs:
           Write-Host "SHA256: $hash"
 
       # ------------------------------------------------------------
-      # 15. Upload artifacts
+      # 18. Upload artifacts
       # ------------------------------------------------------------
       - name: Upload Ladybird ZIP
         uses: actions/upload-artifact@v4
@@ -748,44 +822,58 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # 16. vcpkg diagnostics
+      # 19. vcpkg diagnostics
       # ------------------------------------------------------------
-      - name: Locate vcpkg and dav1d diagnostic files
+      - name: Locate vcpkg diagnostic files
         if: always()
         shell: pwsh
         run: |
-          Write-Host "Searching for dav1d and vcpkg logs..."
+          Write-Host "Searching for vcpkg build logs..."
 
-          $patterns = @(
-            "package-x64-windows-dbg-out.log",
-            "package-x64-windows-rel-out.log",
-            "vcpkg-manifest-install.log",
-            "issue_body.md"
+          $ports = @(
+            "angle",
+            "openssl",
+            "skia",
+            "dav1d"
           )
 
-          foreach ($pattern in $patterns) {
-            Write-Host ""
-            Write-Host "Searching for: $pattern"
+          foreach ($port in $ports) {
+            $directory = Join-Path $env:VCPKG_ROOT "buildtrees\$port"
 
-            Get-ChildItem $env:GITHUB_WORKSPACE -Recurse -File `
-              -Filter $pattern -ErrorAction SilentlyContinue |
-              Select-Object -ExpandProperty FullName
+            Write-Host ""
+            Write-Host "===== $port ====="
+
+            if (Test-Path $directory) {
+              Get-ChildItem $directory -Recurse -File |
+                Where-Object {
+                  $_.Name -match '(out|err)\.log$'
+                } |
+                Select-Object FullName, Length, LastWriteTime
+            }
           }
 
-      - name: Print dav1d failure log tail
+      - name: Print vcpkg failure log tails
         if: failure()
         shell: pwsh
         run: |
-          $candidates = @(
-            "$env:VCPKG_ROOT\buildtrees\dav1d\package-x64-windows-dbg-out.log",
-            "$env:VCPKG_ROOT\buildtrees\dav1d\package-x64-windows-rel-out.log"
-          )
+          $ports = @("angle", "openssl", "skia", "dav1d")
 
-          foreach ($file in $candidates) {
-            if (Test-Path $file) {
+          foreach ($port in $ports) {
+            $directory = Join-Path $env:VCPKG_ROOT "buildtrees\$port"
+
+            if (!(Test-Path $directory)) {
+              continue
+            }
+
+            $logs = Get-ChildItem $directory -Recurse -File |
+              Where-Object {
+                $_.Name -match '(out|err)\.log$'
+              }
+
+            foreach ($file in $logs) {
               Write-Host ""
-              Write-Host "===== $file ====="
-              Get-Content $file -Tail 250
+              Write-Host "===== $($file.FullName) ====="
+              Get-Content $file.FullName -Tail 100
             }
           }
 
@@ -796,13 +884,16 @@ jobs:
           name: Ladybird-vcpkg-diagnostics
           path: |
             vcpkg/buildtrees/dav1d/
+            vcpkg/buildtrees/angle/
+            vcpkg/buildtrees/openssl/
+            vcpkg/buildtrees/skia/
             ladybird/Build/release/vcpkg-manifest-install.log
             ladybird/Build/release/vcpkg_installed/vcpkg/issue_body.md
           if-no-files-found: warn
           retention-days: 7
 
       # ------------------------------------------------------------
-      # 17. Optional GitHub pre-release
+      # 20. Optional GitHub pre-release
       # ------------------------------------------------------------
       - name: Publish GitHub pre-release
         if: success() && inputs.publish_release
