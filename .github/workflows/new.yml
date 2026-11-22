@@ -32,7 +32,7 @@ jobs:
       PACKAGE_NAME: Ladybird-Windows-x64
       VCPKG_DEFAULT_TRIPLET: x64-windows
       VCPKG_DISABLE_METRICS: 1
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/vcpkg-binary-cache
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-binary-cache
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       RUSTFLAGS: "-A deprecated"
       BUILD_TYPE: Release
@@ -399,7 +399,7 @@ jobs:
       - name: Restore vcpkg binary cache
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/vcpkg-binary-cache
+          path: .vcpkg-binary-cache
           key: vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-msvc14.52-${{ hashFiles('ladybird/vcpkg.json', 'vcpkg-overlays/dav1d/portfile.cmake', 'vcpkg-overlays/triplets/x64-windows.cmake') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-msvc14.52-
@@ -413,7 +413,7 @@ jobs:
             -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
 
           Write-Host "vcpkg binary cache: $env:VCPKG_DEFAULT_BINARY_CACHE"
-          Write-Host "Cache directory contents:"
+
           Get-ChildItem $env:VCPKG_DEFAULT_BINARY_CACHE -Force |
             Select-Object Name, Length
 
@@ -448,6 +448,9 @@ jobs:
 
           $buildDir = "ladybird\Build\release"
           New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+
+          New-Item -ItemType Directory -Force `
+            -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
 
           cmake -S ladybird -B $buildDir `
             -G Ninja `
