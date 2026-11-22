@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird source branch, tag or commit"
+        description: "Ladybird source branch, tag or commit SHA"
         required: true
         default: "release/2026.47"
         type: string
@@ -39,9 +39,7 @@ jobs:
       BUILD_TYPE: Release
 
     steps:
-      # --------------------------------------------------
       # 1. Checkout packaging repository
-      # --------------------------------------------------
       - name: Checkout packaging repository
         uses: actions/checkout@v4
         with:
@@ -58,9 +56,7 @@ jobs:
           Write-Host "Packaging repository: $env:GITHUB_REPOSITORY"
           Write-Host "Packaging commit: $shortSha"
 
-      # --------------------------------------------------
       # 2. Install build tools
-      # --------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -109,15 +105,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           foreach ($tool in @(
-            "git",
-            "cmake",
-            "ninja",
-            "clang",
-            "clang-cl",
-            "cl",
-            "rustc",
-            "cargo",
-            "python"
+            "git", "cmake", "ninja", "clang", "clang-cl",
+            "cl", "rustc", "cargo", "python"
           )) {
             $command = Get-Command $tool -ErrorAction Stop
             Write-Host "$tool : $($command.Source)"
@@ -147,7 +136,6 @@ jobs:
           @'
           #include <iostream>
           #include <vector>
-
           int main() {
               std::vector<int> values{1, 2, 3};
               std::cout << values.size() << std::endl;
@@ -161,9 +149,7 @@ jobs:
             throw "clang-cl and MSVC STL compatibility test failed"
           }
 
-      # --------------------------------------------------
       # 3. Checkout Ladybird source
-      # --------------------------------------------------
       - name: Checkout Ladybird source
         shell: pwsh
         run: |
@@ -195,9 +181,7 @@ jobs:
           "LADYBIRD_SHA=$sourceSha" >> $env:GITHUB_ENV
           Write-Host "Ladybird commit: $sourceSha"
 
-      # --------------------------------------------------
       # 4. Read vcpkg baseline
-      # --------------------------------------------------
       - name: Read vcpkg baseline
         shell: pwsh
         run: |
@@ -207,15 +191,13 @@ jobs:
           $baseline = $manifest.'builtin-baseline'
 
           if ([string]::IsNullOrWhiteSpace($baseline)) {
-            throw "builtin-baseline was not found in ladybird/vcpkg.json"
+            throw "builtin-baseline was not found"
           }
 
           "VCPKG_BASELINE=$baseline" >> $env:GITHUB_ENV
           Write-Host "Ladybird vcpkg baseline: $baseline"
 
-      # --------------------------------------------------
       # 5. Checkout and bootstrap vcpkg
-      # --------------------------------------------------
       - name: Checkout and bootstrap vcpkg
         shell: pwsh
         run: |
@@ -227,8 +209,8 @@ jobs:
           }
 
           Set-Location vcpkg
-
           git checkout --detach "$env:VCPKG_BASELINE"
+
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to checkout vcpkg baseline"
           }
@@ -241,12 +223,9 @@ jobs:
           $vcpkgRoot = (Get-Location).Path
           "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
           "$vcpkgRoot" >> $env:GITHUB_PATH
-
           .\vcpkg.exe version
 
-      # --------------------------------------------------
       # 6. Create dav1d overlay port
-      # --------------------------------------------------
       - name: Create dav1d MSVC compatibility overlay
         shell: pwsh
         run: |
@@ -257,7 +236,7 @@ jobs:
           $overlayPort = Join-Path $overlayRoot "dav1d"
 
           if (!(Test-Path "$originalPort\portfile.cmake")) {
-            throw "The dav1d portfile was not found: $originalPort"
+            throw "The dav1d portfile was not found"
           }
 
           New-Item -ItemType Directory -Force -Path $overlayRoot | Out-Null
@@ -307,7 +286,7 @@ jobs:
           $index = $content.IndexOf($marker)
 
           if ($index -lt 0) {
-            throw "Could not find vcpkg_configure_meson in dav1d portfile"
+            throw "Could not find vcpkg_configure_meson"
           }
 
           $content = $content.Insert($index, $patchCode + "`r`n")
@@ -315,9 +294,7 @@ jobs:
 
           "VCPKG_OVERLAY_PORTS=$overlayRoot" >> $env:GITHUB_ENV
 
-      # --------------------------------------------------
       # 7. Create Release-only vcpkg triplet
-      # --------------------------------------------------
       - name: Create Release-only vcpkg triplet
         shell: pwsh
         run: |
@@ -342,16 +319,12 @@ jobs:
 
           "VCPKG_OVERLAY_TRIPLETS=$overlayRoot" >> $env:GITHUB_ENV
 
-      # --------------------------------------------------
       # 8. Restore vcpkg binary cache
-      # --------------------------------------------------
       - name: Restore vcpkg binary cache
         uses: actions/cache@v4
         with:
           path: .vcpkg-binary-cache
           key: vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-${{ hashFiles('ladybird/vcpkg.json', 'vcpkg-overlays/dav1d/portfile.cmake', 'vcpkg-overlays/triplets/x64-windows.cmake') }}
-          restore-keys: |
-            vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-
 
       - name: Initialize vcpkg binary cache
         shell: pwsh
@@ -360,9 +333,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           Write-Host "vcpkg binary cache: $env:VCPKG_DEFAULT_BINARY_CACHE"
 
-      # --------------------------------------------------
       # 9. Clean build directories
-      # --------------------------------------------------
       - name: Clean build directories
         shell: pwsh
         run: |
@@ -379,9 +350,7 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
-      # --------------------------------------------------
       # 10. Configure Ladybird
-      # --------------------------------------------------
       - name: Configure Ladybird
         shell: pwsh
         run: |
@@ -393,6 +362,8 @@ jobs:
           cmake -S ladybird -B $buildDir `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DLADYBIRD_BASELINE_CPU_TARGET=ON `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_LINKER=lld-link `
@@ -412,10 +383,8 @@ jobs:
             throw "CMake configuration failed"
           }
 
-      # --------------------------------------------------
       # 11. Verify CMake configuration
-      # --------------------------------------------------
-      - name: Verify CMake compiler and overlay settings
+      - name: Verify CMake compiler and CPU baseline
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -444,6 +413,7 @@ jobs:
           $cCompiler = Get-CMakeCacheValue "CMAKE_C_COMPILER"
           $cxxCompiler = Get-CMakeCacheValue "CMAKE_CXX_COMPILER"
           $triplet = Get-CMakeCacheValue "VCPKG_TARGET_TRIPLET"
+          $cpuBaseline = Get-CMakeCacheValue "LADYBIRD_BASELINE_CPU_TARGET"
 
           if ($cCompiler -notmatch "clang-cl(\.exe)?$") {
             throw "C compiler is not clang-cl: $cCompiler"
@@ -457,9 +427,13 @@ jobs:
             throw "Unexpected vcpkg triplet: $triplet"
           }
 
-      # --------------------------------------------------
+          if ($cpuBaseline -ne "ON") {
+            throw "CPU baseline is not enabled: $cpuBaseline"
+          }
+
+          Write-Host "Verified CPU baseline: x86-64-v2"
+
       # 12. Build Ladybird
-      # --------------------------------------------------
       - name: Build Ladybird
         shell: pwsh
         run: |
@@ -471,9 +445,7 @@ jobs:
             throw "Ladybird build failed"
           }
 
-      # --------------------------------------------------
       # 13. Verify executable architecture
-      # --------------------------------------------------
       - name: Verify executable architecture
         shell: pwsh
         run: |
@@ -535,7 +507,7 @@ jobs:
               $machine = $reader.ReadUInt16()
 
               if ($signature -ne 0x00004550 -or $machine -ne 0x8664) {
-                throw "Executable is not a valid AMD64 PE: $($exe.FullName)"
+                throw "Executable is not AMD64: $($exe.FullName)"
               }
 
               Write-Host "AMD64: $name"
@@ -547,12 +519,10 @@ jobs:
           }
 
           if ($checked -lt 6) {
-            throw "Too few runtime executables passed architecture verification: $checked"
+            throw "Too few executables passed architecture verification: $checked"
           }
 
-      # --------------------------------------------------
       # 14. Stage runtime package
-      # --------------------------------------------------
       - name: Stage runtime package
         shell: pwsh
         run: |
@@ -584,7 +554,6 @@ jobs:
             "SystemProbe.exe"
           )
 
-          # Copy browser runtime executables only.
           foreach ($name in $runtimeExecutables) {
             $found = Get-ChildItem $buildDir -Recurse -File -Filter $name |
               Where-Object {
@@ -604,7 +573,7 @@ jobs:
             Copy-Item $found.FullName (Join-Path $bin $name) -Force
           }
 
-          # Copy runtime DLLs from the build output.
+          # Copy runtime DLLs
           $dllFiles = Get-ChildItem $buildDir -Recurse -File -Filter "*.dll" |
             Where-Object {
               $_.FullName -notmatch '[\\/]cargo[\\/]build[\\/]' -and
@@ -613,27 +582,25 @@ jobs:
 
           foreach ($dll in $dllFiles) {
             $destination = Join-Path $bin $dll.Name
-
             if (!(Test-Path $destination)) {
               Copy-Item $dll.FullName $destination
             }
           }
 
-          # Copy vcpkg runtime DLLs.
+          # Copy vcpkg runtime DLLs
           $vcpkgBin = Join-Path $buildDir "vcpkg_installed\x64-windows\bin"
 
           if (Test-Path $vcpkgBin) {
             Get-ChildItem $vcpkgBin -File -Filter "*.dll" |
               ForEach-Object {
                 $destination = Join-Path $bin $_.Name
-
                 if (!(Test-Path $destination)) {
                   Copy-Item $_.FullName $destination
                 }
               }
           }
 
-          # Copy Qt runtime plugins while preserving plugin categories.
+          # Copy Qt plugins
           $pluginTypes = @(
             "platforms",
             "imageformats",
@@ -660,7 +627,6 @@ jobs:
               Get-ChildItem $sourcePluginDir -File -Filter "*.dll" |
                 ForEach-Object {
                   $destination = Join-Path $destinationPluginDir $_.Name
-
                   if (!(Test-Path $destination)) {
                     Copy-Item $_.FullName $destination
                   }
@@ -668,21 +634,20 @@ jobs:
             }
           }
 
-          # Copy installed share resources without flattening directories.
+          # Copy installed share resources
           $shareSource = Join-Path $buildDir "share"
 
           if (Test-Path $shareSource) {
             Get-ChildItem $shareSource -Directory |
               ForEach-Object {
                 $destination = Join-Path $share $_.Name
-
                 if (!(Test-Path $destination)) {
                   Copy-Item $_.FullName $destination -Recurse -Force
                 }
               }
           }
 
-          # Copy other discovered resource directories.
+          # Copy additional resources
           $resourceRoots = @(
             (Join-Path $buildDir "UI\Resources"),
             (Join-Path $buildDir "UI\Ladybird\Resources"),
@@ -698,14 +663,13 @@ jobs:
             Get-ChildItem $resourceRoot -Force |
               ForEach-Object {
                 $destination = Join-Path $lagomShare $_.Name
-
                 if (!(Test-Path $destination)) {
                   Copy-Item $_.FullName $destination -Recurse -Force
                 }
               }
           }
 
-          # Locate ICU data if it exists in the build output or vcpkg tree.
+          # Locate ICU data
           $icuData = Get-ChildItem $buildDir -Recurse -File -Filter "icudt*.dat" |
             Select-Object -First 1
 
@@ -721,10 +685,10 @@ jobs:
             Copy-Item $icuData.FullName (Join-Path $icuDir $icuData.Name) -Force
           }
           else {
-            Write-Warning "ICU data file was not found. Runtime must be checked."
+            throw "ICU data file was not found"
           }
 
-          # Locate PDF.js in the build tree.
+          # Locate PDF.js
           $pdfCandidates = Get-ChildItem $buildDir -Directory -Recurse |
             Where-Object {
               (Test-Path (Join-Path $_.FullName "build\pdf.mjs")) -and
@@ -732,7 +696,7 @@ jobs:
             }
 
           if ($pdfCandidates.Count -eq 0) {
-            throw "A complete PDF.js resource directory was not found in the build tree."
+            throw "A complete PDF.js resource directory was not found"
           }
 
           $pdfSource = $pdfCandidates | Select-Object -First 1
@@ -755,7 +719,6 @@ jobs:
             }
           }
 
-          # Check required runtime paths.
           foreach ($required in @(
             "bin\Ladybird.exe",
             "bin\WebContent.exe",
@@ -772,9 +735,7 @@ jobs:
           Get-ChildItem $stage -Recurse -File |
             Select-Object FullName, Length
 
-      # --------------------------------------------------
       # 15. Create launcher and build information
-      # --------------------------------------------------
       - name: Create launcher and build information
         shell: pwsh
         run: |
@@ -790,8 +751,12 @@ jobs:
           @'
           @echo off
           setlocal
-          cd /d "%~dp0bin"
-          start "" "%~dp0bin\Ladybird.exe" %*
+          set "ROOT=%~dp0"
+          set "PATH=%ROOT%bin;%PATH%"
+          set "ICU_DATA=%ROOT%share\Lagom\icu"
+          set "QT_PLUGIN_PATH=%ROOT%bin"
+          cd /d "%ROOT%bin"
+          "%ROOT%bin\Ladybird.exe" %*
           '@ | Set-Content "$stage\Start-Ladybird.bat" -Encoding ascii
 
           @"
@@ -805,14 +770,47 @@ jobs:
           Build timestamp UTC: $env:BUILD_TIMESTAMP
           vcpkg baseline: $env:VCPKG_BASELINE
           Compiler: clang-cl + MSVC STL
+          CPU baseline: x86-64-v2
+          CMake option: LADYBIRD_BASELINE_CPU_TARGET=ON
+          C++ target: x86-64-v2
+          Rust target: x86-64-v2
           vcpkg build: Release-only
           Runtime layout: bin + share/Lagom
           PDF.js: share/Lagom/ladybird/pdfjs
           "@ | Set-Content "$stage\BUILD-INFO.txt" -Encoding utf8
 
-      # --------------------------------------------------
-      # 16. Package inventory and dependency report
-      # --------------------------------------------------
+      # 16. Runtime smoke test
+      - name: Runtime smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $exe = (Resolve-Path "dist\Ladybird-Windows-x64\bin\Ladybird.exe").Path
+          $root = (Resolve-Path "dist\Ladybird-Windows-x64").Path
+
+          $env:PATH = "$root\bin;$env:PATH"
+          $env:ICU_DATA = "$root\share\Lagom\icu"
+          $env:QT_PLUGIN_PATH = "$root\bin"
+
+          Write-Host "Launching Ladybird smoke test..."
+          Write-Host "Executable: $exe"
+
+          $process = Start-Process -FilePath $exe `
+            -WorkingDirectory "$root\bin" `
+            -PassThru
+
+          Start-Sleep -Seconds 20
+          $process.Refresh()
+
+          if ($process.HasExited) {
+            throw "Ladybird exited during smoke test. Exit code: $($process.ExitCode)"
+          }
+
+          Write-Host "Ladybird remained running for 20 seconds."
+
+          Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+
+      # 17. Package inventory
       - name: Generate package inventory
         shell: pwsh
         run: |
@@ -853,9 +851,7 @@ jobs:
               dumpbin.exe /DEPENDENTS $_.FullName 2>&1 | Add-Content $report
             }
 
-      # --------------------------------------------------
-      # 17. Create ZIP archive
-      # --------------------------------------------------
+      # 18. Create ZIP archive
       - name: Create ZIP archive
         shell: pwsh
         run: |
@@ -877,23 +873,19 @@ jobs:
           }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-
           $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
 
           try {
             if ($archive.Entries.Count -eq 0) {
               throw "ZIP archive is empty"
             }
-
             Write-Host "ZIP entries: $($archive.Entries.Count)"
           }
           finally {
             $archive.Dispose()
           }
 
-      # --------------------------------------------------
-      # 18. Generate SHA256
-      # --------------------------------------------------
+      # 19. Generate SHA256
       - name: Generate SHA256
         shell: pwsh
         run: |
@@ -907,9 +899,7 @@ jobs:
 
           Write-Host "SHA256: $hash"
 
-      # --------------------------------------------------
-      # 19. Upload artifacts
-      # --------------------------------------------------
+      # 20. Upload artifacts
       - name: Upload Ladybird ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -933,9 +923,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # --------------------------------------------------
-      # 20. vcpkg diagnostics
-      # --------------------------------------------------
+      # 21. vcpkg diagnostics
       - name: Locate vcpkg diagnostic files
         if: always()
         shell: pwsh
@@ -944,7 +932,6 @@ jobs:
 
           foreach ($port in @("angle", "openssl", "skia", "dav1d")) {
             $directory = Join-Path $env:VCPKG_ROOT "buildtrees\$port"
-
             Write-Host ""
             Write-Host "===== $port ====="
 
@@ -991,9 +978,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # --------------------------------------------------
-      # 21. Optional GitHub pre-release
-      # --------------------------------------------------
+      # 22. Optional GitHub pre-release
       - name: Publish GitHub pre-release
         if: success() && inputs.publish_release
         uses: softprops/action-gh-release@v2
