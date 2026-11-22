@@ -98,7 +98,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           choco install ninja cmake git 7zip -y
 
       - name: Verify build tools
@@ -121,7 +120,6 @@ jobs:
             Write-Host "$tool : $($command.Source)"
           }
 
-          Write-Host ""
           cmake --version
           ninja --version
           clang --version
@@ -204,7 +202,7 @@ jobs:
           Write-Host "Ladybird commit: $sourceSha"
 
       # ------------------------------------------------------------
-      # 4. Bootstrap vcpkg using Ladybird's baseline
+      # 4. Bootstrap vcpkg using Ladybird baseline
       # ------------------------------------------------------------
       - name: Read vcpkg baseline
         shell: pwsh
@@ -250,15 +248,15 @@ jobs:
           }
 
           $vcpkgRoot = (Get-Location).Path
-          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
 
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
           "$vcpkgRoot" >> $env:GITHUB_PATH
 
           Write-Host "vcpkg root: $vcpkgRoot"
           .\vcpkg.exe version
 
       # ------------------------------------------------------------
-      # 5. Create dav1d overlay port and apply MSVC 19.52 fix
+      # 5. Create dav1d overlay port and compatibility workaround
       # ------------------------------------------------------------
       - name: Create dav1d MSVC compatibility overlay
         shell: pwsh
@@ -284,22 +282,17 @@ jobs:
           $portfile = Join-Path $overlayPort "portfile.cmake"
           $content = Get-Content $portfile -Raw
 
-          # dav1d uses Meson in its vcpkg port.
-          # Insert the compatibility fix after source acquisition and
-          # before Meson configuration starts.
           $mesonMarker = "vcpkg_configure_meson"
 
           if (!$content.Contains($mesonMarker)) {
-            throw "Could not find vcpkg_configure_meson in dav1d portfile. Refusing to apply an unverified overlay."
+            throw "Could not find vcpkg_configure_meson in dav1d portfile. Overlay was not modified."
           }
 
           $patchCode = @'
 
-          # ---------------------------------------------------------
           # Local workaround for MSVC 19.52 / MSVC 14.52.
-          # Upstream dav1d fix:
+          # Related upstream dav1d fix:
           # a34e0685b9111b9eb1d7835ea7bea5b425dced73
-          # ---------------------------------------------------------
 
           set(_dav1d_stdatomic "${SOURCE_PATH}/include/compat/msvc/stdatomic.h")
 
@@ -345,18 +338,17 @@ jobs:
           '@
 
           $index = $content.IndexOf($mesonMarker)
-
           $content = $content.Insert($index, $patchCode + "`r`n")
 
           Set-Content -Path $portfile -Value $content -Encoding utf8
 
-          Write-Host "Created overlay port: $overlayPort"
-          Write-Host "Overlay portfile patch injection verified."
+          Write-Host "Created dav1d overlay port: $overlayPort"
+          Write-Host "Overlay patch injection verified."
 
           "VCPKG_OVERLAY_PORTS=$overlayRoot" >> $env:GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 6. Clean previous build output
+      # 6. Clean build directories
       # ------------------------------------------------------------
       - name: Clean build directories
         shell: pwsh
@@ -408,6 +400,9 @@ jobs:
             throw "CMake configuration failed"
           }
 
+      # ------------------------------------------------------------
+      # 8. Verify CMake cache - corrected type-independent check
+      # ------------------------------------------------------------
       - name: Verify CMake compiler and overlay settings
         shell: pwsh
         run: |
@@ -419,22 +414,56 @@ jobs:
             throw "CMakeCache.txt was not generated"
           }
 
-          $content = Get-Content $cache -Raw
+          $content = Get-Content $cache
 
-          foreach ($expected in @(
-            "CMAKE_C_COMPILER:FILEPATH=",
-            "CMAKE_CXX_COMPILER:FILEPATH=",
-            "VCPKG_TARGET_TRIPLET:STRING=x64-windows"
-          )) {
-            if (!$content.Contains($expected)) {
-              throw "Missing expected CMake cache entry: $expected"
+          function Get-CMakeCacheValue {
+            param([string]$Name)
+
+            $line = $content |
+              Where-Object {
+                $_ -match "^$([regex]::Escape($Name)):[^=]*="
+              } |
+              Select-Object -First 1
+
+            if (!$line) {
+              return $null
             }
+
+            return ($line -replace "^[^=]*=", "").Trim()
           }
 
-          Write-Host "CMake cache verification passed."
+          $cCompiler = Get-CMakeCacheValue "CMAKE_C_COMPILER"
+          $cxxCompiler = Get-CMakeCacheValue "CMAKE_CXX_COMPILER"
+          $triplet = Get-CMakeCacheValue "VCPKG_TARGET_TRIPLET"
+
+          Write-Host "C compiler: $cCompiler"
+          Write-Host "CXX compiler: $cxxCompiler"
+          Write-Host "vcpkg triplet: $triplet"
+
+          if ([string]::IsNullOrWhiteSpace($cCompiler)) {
+            throw "CMAKE_C_COMPILER is missing from CMakeCache.txt"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($cxxCompiler)) {
+            throw "CMAKE_CXX_COMPILER is missing from CMakeCache.txt"
+          }
+
+          if ($cCompiler -notmatch "clang-cl(\.exe)?$") {
+            throw "C compiler is not clang-cl: $cCompiler"
+          }
+
+          if ($cxxCompiler -notmatch "clang-cl(\.exe)?$") {
+            throw "CXX compiler is not clang-cl: $cxxCompiler"
+          }
+
+          if ($triplet -ne "x64-windows") {
+            throw "Unexpected vcpkg triplet: $triplet"
+          }
+
+          Write-Host "CMake compiler and vcpkg configuration verified."
 
       # ------------------------------------------------------------
-      # 8. Build
+      # 9. Build
       # ------------------------------------------------------------
       - name: Build Ladybird
         shell: pwsh
@@ -448,14 +477,14 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 9. Verify executables
+      # 10. Verify executable architecture
       # ------------------------------------------------------------
       - name: Verify executable architecture
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $buildDir = Resolve-Path "ladybird\Build\release"
+          $buildDir = (Resolve-Path "ladybird\Build\release").Path
 
           $executables = Get-ChildItem $buildDir -Recurse -File -Filter "*.exe"
 
@@ -492,7 +521,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # 10. Stage runtime files
+      # 11. Stage runtime package
       # ------------------------------------------------------------
       - name: Stage runtime package
         shell: pwsh
@@ -504,7 +533,6 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # Copy generated executables and DLLs.
           Get-ChildItem $buildDir -Recurse -File |
             Where-Object {
               $_.Extension -in @(".exe", ".dll")
@@ -513,7 +541,6 @@ jobs:
               Copy-Item $_.FullName $stage -Force
             }
 
-          # Copy vcpkg runtime DLLs.
           $vcpkgBin = Join-Path $buildDir "vcpkg_installed\x64-windows\bin"
 
           if (Test-Path $vcpkgBin) {
@@ -523,7 +550,6 @@ jobs:
               }
           }
 
-          # Copy Ladybird resources when present.
           $resourceCandidates = @(
             "ladybird\Resources",
             "ladybird\resources",
@@ -535,12 +561,10 @@ jobs:
           foreach ($resource in $resourceCandidates) {
             if (Test-Path $resource) {
               $destination = Join-Path $stage (Split-Path $resource -Leaf)
-
               Copy-Item $resource $destination -Recurse -Force
             }
           }
 
-          # Preserve Qt plugins if they exist in the build tree.
           $qtPlugins = Get-ChildItem $buildDir -Directory -Recurse |
             Where-Object { $_.Name -eq "plugins" }
 
@@ -561,7 +585,7 @@ jobs:
             Select-Object FullName, Length
 
       # ------------------------------------------------------------
-      # 11. Launcher and build information
+      # 12. Launcher and build information
       # ------------------------------------------------------------
       - name: Create launcher and build information
         shell: pwsh
@@ -604,7 +628,7 @@ jobs:
           "@ | Set-Content "$stage\BUILD-INFO.txt" -Encoding utf8
 
       # ------------------------------------------------------------
-      # 12. Package audit
+      # 13. Package audit
       # ------------------------------------------------------------
       - name: Generate package inventory
         shell: pwsh
@@ -612,11 +636,12 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $stage = "dist\Ladybird-Windows-x64"
+          $stageRoot = (Resolve-Path $stage).Path
 
           Get-ChildItem $stage -Recurse -File |
             ForEach-Object {
               $relative = $_.FullName.Substring(
-                (Resolve-Path $stage).Path.Length
+                $stageRoot.Length
               ).TrimStart("\")
               "$relative`t$($_.Length)"
             } |
@@ -648,7 +673,7 @@ jobs:
             }
 
       # ------------------------------------------------------------
-      # 13. ZIP and checksum
+      # 14. ZIP and checksum
       # ------------------------------------------------------------
       - name: Create ZIP archive
         shell: pwsh
@@ -697,7 +722,7 @@ jobs:
           Write-Host "SHA256: $hash"
 
       # ------------------------------------------------------------
-      # 14. Upload artifacts
+      # 15. Upload artifacts
       # ------------------------------------------------------------
       - name: Upload Ladybird ZIP
         uses: actions/upload-artifact@v4
@@ -723,7 +748,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # 15. vcpkg diagnostics - run even when build fails
+      # 16. vcpkg diagnostics
       # ------------------------------------------------------------
       - name: Locate vcpkg and dav1d diagnostic files
         if: always()
@@ -777,7 +802,7 @@ jobs:
           retention-days: 7
 
       # ------------------------------------------------------------
-      # 16. Optional GitHub pre-release
+      # 17. Optional GitHub pre-release
       # ------------------------------------------------------------
       - name: Publish GitHub pre-release
         if: success() && inputs.publish_release
