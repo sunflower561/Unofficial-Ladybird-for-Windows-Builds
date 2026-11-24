@@ -28,7 +28,6 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 360
 
-    # Physical short workspace. No junction and no SUBST.
     defaults:
       run:
         working-directory: D:\a\_temp\lb
@@ -64,8 +63,8 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $shortRoot | Out-Null
 
-          # Copy the checked-out repository, including .git metadata.
-          # This creates a real physical directory, not a junction.
+          Write-Host "Copying repository to physical short workspace..."
+
           & robocopy.exe "$env:GITHUB_WORKSPACE" "$shortRoot" /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /NFL /NDL /NP
 
           $copyCode = $LASTEXITCODE
@@ -74,6 +73,8 @@ jobs:
             throw "Robocopy failed with exit code $copyCode"
           }
 
+          Write-Host "Robocopy completed successfully. Exit code: $copyCode"
+
           if (!(Test-Path (Join-Path $shortRoot ".git"))) {
             throw "Copied repository is missing .git metadata"
           }
@@ -81,7 +82,9 @@ jobs:
           "SHORT_WORKSPACE=$shortRoot" >> $env:GITHUB_ENV
 
           Write-Host "Physical short workspace: $shortRoot"
-          Write-Host "Robocopy exit code: $copyCode"
+          Write-Host "Repository copy verified."
+
+          $global:LASTEXITCODE = 0
 
       - name: Set build metadata
         shell: pwsh
@@ -126,6 +129,8 @@ jobs:
 
           $llvmBin >> $env:GITHUB_PATH
 
+          $global:LASTEXITCODE = 0
+
       - name: Install build utilities
         shell: pwsh
         run: |
@@ -136,6 +141,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Build utilities installation failed"
           }
+
+          $global:LASTEXITCODE = 0
 
       - name: Verify toolchain
         shell: pwsh
@@ -152,6 +159,8 @@ jobs:
           clang-cl --version
           rustc --version
           cargo --version
+
+          $global:LASTEXITCODE = 0
 
       - name: Checkout Ladybird source
         shell: pwsh
@@ -204,6 +213,8 @@ jobs:
 
           Write-Host "Ladybird source SHA: $sha"
 
+          $global:LASTEXITCODE = 0
+
       - name: Read vcpkg baseline
         shell: pwsh
         run: |
@@ -252,6 +263,8 @@ jobs:
 
           .\vcpkg.exe version
 
+          $global:LASTEXITCODE = 0
+
       - name: Create dav1d compatibility overlay
         shell: pwsh
         run: |
@@ -277,10 +290,10 @@ jobs:
           $content = Get-Content $portfile -Raw
 
           $patch = @'
-          # Work around the MSVC 19.52 stdatomic compatibility issue.
+          # Work around the MSVC stdatomic compatibility issue.
           set(_dav1d_stdatomic "${SOURCE_PATH}/include/compat/msvc/stdatomic.h")
           if(NOT EXISTS "${_dav1d_stdatomic}")
-              message(FATAL_ERROR "dav1d stdatomic.h not found: ${_dav1d_stdatomic}")
+              message(FATAL_ERROR "dav1d stdatomic.h not found")
           endif()
           file(READ "${_dav1d_stdatomic}" _dav1d_content)
           set(_dav1d_old "#if defined(__clang__) && __has_include_next(<stdatomic.h>)")
@@ -393,6 +406,8 @@ jobs:
             throw "CMake configure failed"
           }
 
+          $global:LASTEXITCODE = 0
+
       - name: Verify CMake CPU baseline setting
         shell: pwsh
         run: |
@@ -451,6 +466,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird build failed"
           }
+
+          $global:LASTEXITCODE = 0
 
       - name: Verify C++ CPU baseline compiler flags
         shell: pwsh
@@ -585,7 +602,6 @@ jobs:
             Copy-Item $file.FullName (Join-Path $bin $name) -Force
           }
 
-          # Copy DLLs produced by the build.
           Get-ChildItem $build -Recurse -File -Filter "*.dll" |
             Where-Object {
               $_.FullName -notmatch '[\\/]cargo[\\/]build[\\/]' -and
@@ -599,7 +615,6 @@ jobs:
               }
             }
 
-          # Copy vcpkg runtime DLLs.
           $vcpkgBin = Join-Path $build "vcpkg_installed\x64-windows\bin"
 
           if (Test-Path $vcpkgBin) {
@@ -613,7 +628,6 @@ jobs:
               }
           }
 
-          # Copy Qt plugin directories found in the build tree.
           $pluginNames = @(
             "platforms", "imageformats", "styles",
             "tls", "networkinformation", "position"
@@ -644,7 +658,6 @@ jobs:
               }
             }
 
-          # Copy installed share resources without flattening directories.
           $shareSource = Join-Path $build "share"
 
           if (Test-Path $shareSource) {
@@ -658,7 +671,6 @@ jobs:
               }
           }
 
-          # Copy UI/resource directories where present.
           $resourceRoots = @(
             (Join-Path $build "UI\Resources"),
             (Join-Path $build "UI\Ladybird\Resources"),
@@ -679,7 +691,6 @@ jobs:
             }
           }
 
-          # Ensure ICU data is included.
           $icu = Get-ChildItem $build -Recurse -File -Filter "icudt*.dat" |
             Select-Object -First 1
 
@@ -701,7 +712,6 @@ jobs:
 
           Copy-Item $icu.FullName (Join-Path $icuDir $icu.Name) -Force
 
-          # Find and include PDF.js if present.
           $pdf = Get-ChildItem "ladybird" -Directory -Recurse -ErrorAction SilentlyContinue |
             Where-Object {
               (Test-Path (Join-Path $_.FullName "build\pdf.mjs")) -and
@@ -719,16 +729,10 @@ jobs:
             Write-Warning "PDF.js directory not found in source tree; it was not staged."
           }
 
-          if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
-            throw "Staged Ladybird.exe missing"
-          }
-
-          if (!(Test-Path (Join-Path $bin "WebContent.exe"))) {
-            throw "Staged WebContent.exe missing"
-          }
-
-          if (!(Test-Path (Join-Path $bin "Compositor.exe"))) {
-            throw "Staged Compositor.exe missing"
+          foreach ($required in @("Ladybird.exe", "WebContent.exe", "Compositor.exe")) {
+            if (!(Test-Path (Join-Path $bin $required))) {
+              throw "Staged executable missing: $required"
+            }
           }
 
       - name: Create launcher and build information
@@ -761,8 +765,8 @@ jobs:
           vcpkg baseline: $env:VCPKG_BASELINE
           Compiler: clang-cl with MSVC STL
           CPU baseline option: LADYBIRD_BASELINE_CPU_TARGET=ON
-          C/C++ target: x86-64-v3 (clang-cl /clang:-march=x86-64-v3)
-          Rust target: x86-64-v3 (-C target-cpu=x86-64-v3)
+          C/C++ target: x86-64-v3
+          Rust target: x86-64-v3
           vcpkg triplet: x64-windows (Release-only)
           "@ | Set-Content "$stage\BUILD-INFO.txt" -Encoding utf8
 
@@ -854,7 +858,7 @@ jobs:
 
             Get-Content $log
 
-            throw "Ladybird smoke test failed. Download the Ladybird-Windows-crash-diagnostics artifact."
+            throw "Ladybird smoke test failed. Download the crash diagnostics artifact."
           }
 
           "RESULT: PASSED - main process remained alive for 20 seconds" | Add-Content $log
@@ -863,7 +867,7 @@ jobs:
 
           & taskkill.exe /PID $p.Id /T /F 2>$null | Out-Null
 
-          exit 0
+          $global:LASTEXITCODE = 0
 
       - name: Upload crash diagnostics
         if: always()
@@ -910,6 +914,8 @@ jobs:
               "`r`n===== $($_.FullName) =====" | Add-Content "dist\DEPENDENCIES.txt"
               dumpbin.exe /DEPENDENTS $_.FullName 2>&1 | Add-Content "dist\DEPENDENCIES.txt"
             }
+
+          $global:LASTEXITCODE = 0
 
       - name: Create ZIP archive
         shell: pwsh
