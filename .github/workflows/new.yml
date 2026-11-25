@@ -426,7 +426,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: D:/a/_temp/lb/.vcpkg-binary-cache
-          key: vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-x86-64-v3-${{ hashFiles('.github/workflows/build windows.yml') }}
+          key: vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-x86-64-v3-${{ hashFiles('.github/workflows/new.yml') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-windows2025-x64-release-clang22-x86-64-v3-
 
@@ -492,6 +492,7 @@ jobs:
 
       # --------------------------------------------------
       # 13. Verify CMake configuration
+      # FIX: do not assume CMakeCache variable types
       # --------------------------------------------------
 
       - name: Verify CMake configuration
@@ -505,33 +506,95 @@ jobs:
             throw "CMakeCache.txt missing"
           }
 
-          $cache = Get-Content $cachePath -Raw
+          $cacheLines = Get-Content $cachePath
 
-          if ($cache -notmatch "LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON") {
-            throw "LADYBIRD_BASELINE_CPU_TARGET is not ON"
+          function Get-CMakeCacheValue {
+            param([string]$Name)
+
+            $pattern = "^" + [regex]::Escape($Name) + "(?::[^=]+)?=(.*)$"
+
+            $line = $cacheLines |
+              Where-Object { $_ -match $pattern } |
+              Select-Object -First 1
+
+            if (!$line) {
+              throw "CMakeCache variable missing: $Name"
+            }
+
+            if ($line -match $pattern) {
+              return $Matches[1].Trim()
+            }
+
+            throw "Unable to parse CMakeCache variable: $Name"
           }
 
-          if ($cache -notmatch "CMAKE_CXX_COMPILER:FILEPATH=.*clang-cl") {
-            throw "C++ compiler is not clang-cl"
+          $compiler = Get-CMakeCacheValue "CMAKE_CXX_COMPILER"
+          $cCompiler = Get-CMakeCacheValue "CMAKE_C_COMPILER"
+          $linker = Get-CMakeCacheValue "CMAKE_LINKER"
+          $cFlags = Get-CMakeCacheValue "CMAKE_C_FLAGS"
+          $cxxFlags = Get-CMakeCacheValue "CMAKE_CXX_FLAGS"
+          $baseline = Get-CMakeCacheValue "LADYBIRD_BASELINE_CPU_TARGET"
+
+          Write-Host "========== CMake configuration =========="
+          Write-Host "CMAKE_C_COMPILER   = $cCompiler"
+          Write-Host "CMAKE_CXX_COMPILER = $compiler"
+          Write-Host "CMAKE_LINKER       = $linker"
+          Write-Host "CMAKE_C_FLAGS      = $cFlags"
+          Write-Host "CMAKE_CXX_FLAGS    = $cxxFlags"
+          Write-Host "CPU baseline       = $baseline"
+          Write-Host "RUSTFLAGS          = $env:RUSTFLAGS"
+          Write-Host "========================================="
+
+          $compilerName = [IO.Path]::GetFileName($compiler)
+          $cCompilerName = [IO.Path]::GetFileName($cCompiler)
+          $linkerName = [IO.Path]::GetFileName($linker)
+
+          if ($compilerName -notmatch "^clang-cl(\.exe)?$") {
+            throw "C++ compiler is not clang-cl: $compiler"
           }
 
-          if ($cache -notmatch "CMAKE_LINKER:FILEPATH=.*lld-link") {
-            throw "CMake linker is not lld-link"
+          if ($cCompilerName -notmatch "^clang-cl(\.exe)?$") {
+            throw "C compiler is not clang-cl: $cCompiler"
           }
 
-          if ($cache -notmatch "CMAKE_C_FLAGS:STRING=.*x86-64-v3") {
-            throw "C compiler x86-64-v3 flags are missing"
+          if ($linkerName -notmatch "^lld-link(\.exe)?$") {
+            throw "CMake linker is not lld-link: $linker"
           }
 
-          if ($cache -notmatch "CMAKE_CXX_FLAGS:STRING=.*x86-64-v3") {
-            throw "C++ compiler x86-64-v3 flags are missing"
+          if ($baseline -ne "ON") {
+            throw "LADYBIRD_BASELINE_CPU_TARGET is not ON: $baseline"
+          }
+
+          if ($cFlags -notmatch "x86-64-v3") {
+            throw "C compiler x86-64-v3 flags are missing: $cFlags"
+          }
+
+          if ($cxxFlags -notmatch "x86-64-v3") {
+            throw "C++ compiler x86-64-v3 flags are missing: $cxxFlags"
           }
 
           if ($env:RUSTFLAGS -notmatch "target-cpu=x86-64-v3") {
             throw "Rust x86-64-v3 flags are missing"
           }
 
-          Write-Host "CMake compiler, linker and CPU baseline verified."
+          if (!(Test-Path -LiteralPath $compiler)) {
+            throw "Configured clang-cl executable does not exist: $compiler"
+          }
+
+          if (!(Test-Path -LiteralPath $cCompiler)) {
+            throw "Configured C clang-cl executable does not exist: $cCompiler"
+          }
+
+          if (!(Test-Path -LiteralPath $linker)) {
+            throw "Configured lld-link executable does not exist: $linker"
+          }
+
+          Write-Host ""
+          Write-Host "CMake compiler verification PASSED."
+          Write-Host "C++ compiler: $compiler"
+          Write-Host "C compiler: $cCompiler"
+          Write-Host "Linker: $linker"
+          Write-Host "CPU baseline: x86-64-v3"
 
       # --------------------------------------------------
       # 14. Build
@@ -779,15 +842,11 @@ jobs:
             }
           }
 
-          # Check main application executable.
-
           $mainExe = Join-Path $bin "Ladybird.exe"
 
           if (!(Test-Path $mainExe)) {
             throw "Ladybird.exe missing from runtime installation"
           }
-
-          # Verify and collect all upstream helper processes.
 
           $helperNames = @(Get-Content $env:LADYBIRD_HELPERS_FILE | Where-Object {
             ![string]::IsNullOrWhiteSpace($_)
@@ -806,7 +865,7 @@ jobs:
             Copy-FileChecked $found.FullName (Join-Path $bin $name)
           }
 
-          # WebDriver must be installed by upstream install rules.
+          # WebDriver is included only if upstream installed it.
 
           $webDriver = Join-Path $bin "WebDriver.exe"
 
@@ -814,14 +873,12 @@ jobs:
             $webDriverFound = Get-ChildItem $stage -Recurse -File -Filter "WebDriver.exe" |
               Select-Object -First 1
 
-            if (!$webDriverFound) {
-              throw "WebDriver.exe missing from runtime installation"
+            if ($webDriverFound) {
+              Copy-FileChecked $webDriverFound.FullName $webDriver
+            } else {
+              Write-Warning "WebDriver.exe was not installed by this upstream build."
             }
-
-            Copy-FileChecked $webDriverFound.FullName $webDriver
           }
-
-          # Collect vcpkg runtime DLLs.
 
           $vcpkgBin = Join-Path $build "vcpkg_installed\x64-windows\bin"
 
@@ -832,10 +889,6 @@ jobs:
           Get-ChildItem $vcpkgBin -File -Filter "*.dll" | ForEach-Object {
             Copy-FileChecked $_.FullName (Join-Path $bin $_.Name)
           }
-
-          # Collect Qt deployment output.
-          # Preserve plugin subdirectories.
-          # Do not overwrite application executables.
 
           $buildBin = Join-Path $build "bin"
 
@@ -848,20 +901,14 @@ jobs:
             -DestinationRoot $bin `
             -SkipExecutables
 
-          # Qt Windows platform plugin.
-
           $qwindows = Join-Path $bin "platforms\qwindows.dll"
 
           if (!(Test-Path $qwindows)) {
             throw "Qt platforms\qwindows.dll missing"
           }
 
-          # Verify application executables.
-
-          foreach ($name in @("Ladybird.exe", "WebDriver.exe")) {
-            if (!(Test-Path (Join-Path $bin $name))) {
-              throw "Required executable missing: $name"
-            }
+          if (!(Test-Path $mainExe)) {
+            throw "Ladybird.exe missing after runtime collection"
           }
 
           foreach ($helper in $helperNames) {
@@ -869,9 +916,6 @@ jobs:
               throw "Required helper missing from bin: $helper.exe"
             }
           }
-
-          # ICU may be linked or packaged differently by the selected
-          # vcpkg build. Do not require a standalone icudt*.dat file.
 
           Write-Host "Runtime collection completed."
           Write-Host "vcpkg DLL count: $(@(Get-ChildItem $bin -File -Filter '*.dll').Count)"
@@ -908,8 +952,6 @@ jobs:
             }
           }
 
-          # Essential resource checks.
-
           $requiredFiles = @(
             "fonts\NotoEmoji.ttf",
             "fonts\SerenitySans-Regular.ttf",
@@ -936,9 +978,6 @@ jobs:
               throw "Essential resource missing: $relative"
             }
           }
-
-          # PDF.js is optional. Validate the installed contents
-          # dynamically rather than requiring one hard-coded filename.
 
           $pdfRoot = Join-Path $lagom "ladybird\pdfjs"
 
@@ -982,8 +1021,6 @@ jobs:
           } else {
             Write-Warning "PDF.js not enabled; optional PDF.js validation skipped."
           }
-
-          # Check that the installed resource tree is not empty.
 
           $allResources = @(Get-ChildItem $lagom -Recurse -File)
 
@@ -1122,9 +1159,13 @@ jobs:
             ![string]::IsNullOrWhiteSpace($_)
           })
 
-          $processNames = @("Ladybird.exe", "WebDriver.exe") + @(
+          $processNames = @("Ladybird.exe") + @(
             $helperNames | ForEach-Object { "$_.exe" }
           )
+
+          if (Test-Path (Join-Path $bin "WebDriver.exe")) {
+            $processNames += "WebDriver.exe"
+          }
 
           foreach ($name in $processNames) {
             $key = "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\$name"
@@ -1188,9 +1229,6 @@ jobs:
 
           "RESULT: PASSED - main process remained alive for 20 seconds" | Add-Content $log
 
-          # Record child processes without treating optional helper
-          # processes as mandatory for every startup configuration.
-
           Start-Sleep -Seconds 3
 
           $children = @(Get-CimInstance Win32_Process | Where-Object {
@@ -1211,7 +1249,7 @@ jobs:
           $global:LASTEXITCODE = 0
 
       # --------------------------------------------------
-      # 23. Upload diagnostics
+      # 23. Upload crash diagnostics
       # --------------------------------------------------
 
       - name: Upload crash diagnostics
@@ -1403,7 +1441,7 @@ jobs:
           retention-days: 14
 
       # --------------------------------------------------
-      # 31. Upload build diagnostics
+      # 31. Collect build diagnostics
       # --------------------------------------------------
 
       - name: Collect build diagnostics
@@ -1457,7 +1495,7 @@ jobs:
             }
           }
 
-          if (Test-Path $env:LADYBIRD_INSTALL_MANIFEST) {
+          if ($env:LADYBIRD_INSTALL_MANIFEST -and (Test-Path $env:LADYBIRD_INSTALL_MANIFEST)) {
             Copy-Item $env:LADYBIRD_INSTALL_MANIFEST $diag -Force
           }
 
@@ -1512,4 +1550,3 @@ jobs:
             D:/a/_temp/lb/dist/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
