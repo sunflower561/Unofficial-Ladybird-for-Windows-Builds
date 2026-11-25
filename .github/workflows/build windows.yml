@@ -93,6 +93,15 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Enable Windows Git long paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git config --global core.longpaths true
+          $longPaths = (git config --global --get core.longpaths).Trim()
+          if ($longPaths -ne "true") { throw "Could not enable Git long path support" }
+          Write-Host "Git core.longpaths = $longPaths"
+
       - name: Checkout Ladybird source
         shell: pwsh
         run: |
