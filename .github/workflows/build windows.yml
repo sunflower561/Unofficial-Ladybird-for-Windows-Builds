@@ -34,7 +34,6 @@ jobs:
       RUSTFLAGS: "-C target-cpu=x86-64-v3"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
       LLVM_VERSION: "23.1.6"
-      LLVM_ROOT: "C:\\LLVM\\23.1.6"
 
     defaults:
       run:
@@ -92,16 +91,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Do not install LLVM through Chocolatey.
-      # Chocolatey previously supplied LLVM 20.1.8 instead of 23.1.6.
+      # LLVM must be installed separately.
+      # Do not use Chocolatey for LLVM because it previously installed 20.1.8.
       - name: Install pinned LLVM 23.1.6
         run: |
           $ErrorActionPreference = "Stop"
 
           $version = $env:LLVM_VERSION
-          $llvmRoot = $env:LLVM_ROOT
           $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.msi"
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.msi"
+          $log = Join-Path $env:RUNNER_TEMP "llvm-install.log"
 
           Write-Host "Downloading official LLVM $version Windows x64 MSI"
           Write-Host $url
@@ -116,17 +115,15 @@ jobs:
             throw "LLVM installer is unexpectedly small"
           }
 
-          $installDir = Split-Path $llvmRoot -Parent
-          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-
-          Write-Host "Installing LLVM into: $llvmRoot"
+          Write-Host "Installing LLVM..."
 
           $arguments = @(
             "/i"
             "`"$installer`""
             "/qn"
             "/norestart"
-            "INSTALLDIR=`"$llvmRoot`""
+            "/L*v"
+            "`"$log`""
           )
 
           $process = Start-Process -FilePath "msiexec.exe" `
@@ -135,29 +132,92 @@ jobs:
             -PassThru
 
           if ($process.ExitCode -notin @(0, 3010)) {
+            if (Test-Path $log) {
+              Get-Content $log -Tail 100
+            }
             throw "LLVM MSI installation failed: $($process.ExitCode)"
           }
 
-          $clang = Join-Path $llvmRoot "bin\clang-cl.exe"
-          $lld = Join-Path $llvmRoot "bin\lld-link.exe"
+          Write-Host "Searching for installed LLVM executables..."
 
-          if (!(Test-Path $clang)) {
-            throw "clang-cl.exe not found at expected LLVM path: $clang"
+          $searchRoots = @(
+            "C:\Program Files\LLVM",
+            "C:\Program Files (x86)\LLVM",
+            "C:\LLVM"
+          )
+
+          $clang = $null
+
+          # Check common installation locations first.
+          $candidates = @(
+            "C:\Program Files\LLVM\bin\clang-cl.exe",
+            "C:\Program Files (x86)\LLVM\bin\clang-cl.exe",
+            "C:\LLVM\23.1.6\bin\clang-cl.exe",
+            "C:\LLVM\bin\clang-cl.exe"
+          )
+
+          foreach ($candidate in $candidates) {
+            if (Test-Path $candidate) {
+              $clang = $candidate
+              break
+            }
           }
+
+          # If the installation location differs, search known LLVM roots.
+          if (!$clang) {
+            foreach ($root in $searchRoots) {
+              if (Test-Path $root) {
+                $found = Get-ChildItem -Path $root `
+                  -Filter "clang-cl.exe" `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+                if ($found) {
+                  $clang = $found.FullName
+                  break
+                }
+              }
+            }
+          }
+
+          if (!$clang) {
+            Write-Host "LLVM installation log:"
+            if (Test-Path $log) {
+              Get-Content $log -Tail 150
+            }
+            throw "clang-cl.exe was not found after LLVM installation"
+          }
+
+          $bin = Split-Path $clang -Parent
+          $llvmRoot = Split-Path $bin -Parent
+          $lld = Join-Path $bin "lld-link.exe"
 
           if (!(Test-Path $lld)) {
-            throw "lld-link.exe not found at expected LLVM path: $lld"
+            throw "lld-link.exe not found beside clang-cl.exe: $lld"
           }
 
-          $llvmBin = Join-Path $llvmRoot "bin"
-          $env:PATH = "$llvmBin;$env:PATH"
-          $llvmBin >> $env:GITHUB_PATH
+          Write-Host "Detected LLVM root: $llvmRoot"
+          Write-Host "Detected clang-cl: $clang"
+          Write-Host "Detected lld-link: $lld"
 
+          $versionOutput = (& $clang --version | Out-String)
+
+          Write-Host $versionOutput
+
+          if ($versionOutput -notmatch "23\.1\.6") {
+            throw "Wrong LLVM version. Expected 23.1.6. Actual: $versionOutput"
+          }
+
+          # Export actual paths for every subsequent step.
           "LLVM_ROOT=$llvmRoot" >> $env:GITHUB_ENV
           "LLVM_CLANG_CL=$clang" >> $env:GITHUB_ENV
           "LLVM_LLD_LINK=$lld" >> $env:GITHUB_ENV
 
-          Write-Host "LLVM installation completed."
+          "$bin" >> $env:GITHUB_PATH
+
+          Write-Host "LLVM $version installed and verified."
 
       - name: Install remaining build tools
         run: |
@@ -175,15 +235,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
-          $lld = Join-Path $env:LLVM_ROOT "bin\lld-link.exe"
+          $clang = $env:LLVM_CLANG_CL
+          $lld = $env:LLVM_LLD_LINK
 
           if (!(Test-Path $clang)) {
-            throw "Pinned clang-cl.exe is missing"
+            throw "Pinned clang-cl.exe is missing: $clang"
           }
 
           if (!(Test-Path $lld)) {
-            throw "Pinned lld-link.exe is missing"
+            throw "Pinned lld-link.exe is missing: $lld"
           }
 
           Write-Host "===== Pinned clang-cl ====="
@@ -196,7 +256,7 @@ jobs:
           $versionOutput = (& $clang --version | Out-String)
 
           if ($versionOutput -notmatch "23\.1\.6") {
-            throw "Wrong Clang version. Expected 23.1.6. Actual output: $versionOutput"
+            throw "Wrong Clang version. Expected 23.1.6."
           }
 
           Write-Host "===== Pinned lld-link ====="
@@ -208,10 +268,6 @@ jobs:
 
           Write-Host "===== MSVC ====="
           cl
-
-          if ($LASTEXITCODE -notin @(0, 2)) {
-            Write-Host "MSVC version command returned: $LASTEXITCODE"
-          }
 
           Write-Host "===== CMake ====="
           cmake --version
@@ -438,14 +494,13 @@ jobs:
 
           $build = "ladybird\Build\release"
 
-          # Always remove the old CMake cache and build directory.
-          # This prevents CMake from reusing Clang 20.1.8.
           if (Test-Path $build) {
             Remove-Item $build -Recurse -Force
           }
 
-          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
-          $lld = Join-Path $env:LLVM_ROOT "bin\lld-link.exe"
+          # Always use the exact compiler paths detected during installation.
+          $clang = $env:LLVM_CLANG_CL
+          $lld = $env:LLVM_LLD_LINK
 
           if (!(Test-Path $clang)) {
             throw "Pinned clang-cl not found: $clang"
@@ -504,7 +559,6 @@ jobs:
             throw "CMake configuration failed"
           }
 
-          # Verify the actual compiler paths recorded by CMake.
           $cacheFile = Join-Path $build "CMakeCache.txt"
           $cache = Get-Content $cacheFile -Raw
 
@@ -577,8 +631,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           Set-Location $env:BUILD_ROOT
 
-          # Confirm the compiler is still the pinned version before building.
-          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
+          $clang = $env:LLVM_CLANG_CL
           $versionOutput = (& $clang --version | Out-String)
 
           if ($versionOutput -notmatch "23\.1\.6") {
