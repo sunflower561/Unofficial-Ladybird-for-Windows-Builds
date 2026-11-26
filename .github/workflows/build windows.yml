@@ -100,9 +100,6 @@ jobs:
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.msi"
           $log = Join-Path $env:RUNNER_TEMP "llvm-install.log"
 
-          Write-Host "Downloading official LLVM $version Windows x64 MSI"
-          Write-Host $url
-
           Invoke-WebRequest -Uri $url -OutFile $installer
 
           if (!(Test-Path $installer)) {
@@ -112,8 +109,6 @@ jobs:
           if ((Get-Item $installer).Length -lt 100MB) {
             throw "LLVM installer is unexpectedly small"
           }
-
-          Write-Host "Installing LLVM..."
 
           $arguments = @(
             "/i"
@@ -131,20 +126,10 @@ jobs:
 
           if ($process.ExitCode -notin @(0, 3010)) {
             if (Test-Path $log) {
-              Get-Content $log -Tail 100
+              Get-Content $log -Tail 150
             }
-            throw "LLVM MSI installation failed: $($process.ExitCode)"
+            throw "LLVM installation failed: $($process.ExitCode)"
           }
-
-          Write-Host "Searching for installed LLVM executables..."
-
-          $searchRoots = @(
-            "C:\Program Files\LLVM",
-            "C:\Program Files (x86)\LLVM",
-            "C:\LLVM"
-          )
-
-          $clang = $null
 
           $candidates = @(
             "C:\Program Files\LLVM\bin\clang-cl.exe",
@@ -152,6 +137,8 @@ jobs:
             "C:\LLVM\23.1.6\bin\clang-cl.exe",
             "C:\LLVM\bin\clang-cl.exe"
           )
+
+          $clang = $null
 
           foreach ($candidate in $candidates) {
             if (Test-Path $candidate) {
@@ -161,13 +148,13 @@ jobs:
           }
 
           if (!$clang) {
-            foreach ($root in $searchRoots) {
+            foreach ($root in @(
+              "C:\Program Files\LLVM",
+              "C:\Program Files (x86)\LLVM",
+              "C:\LLVM"
+            )) {
               if (Test-Path $root) {
-                $found = Get-ChildItem -Path $root `
-                  -Filter "clang-cl.exe" `
-                  -File `
-                  -Recurse `
-                  -ErrorAction SilentlyContinue |
+                $found = Get-ChildItem $root -Filter "clang-cl.exe" -File -Recurse -ErrorAction SilentlyContinue |
                   Select-Object -First 1
 
                 if ($found) {
@@ -179,11 +166,10 @@ jobs:
           }
 
           if (!$clang) {
-            Write-Host "LLVM installation log:"
             if (Test-Path $log) {
               Get-Content $log -Tail 150
             }
-            throw "clang-cl.exe was not found after LLVM installation"
+            throw "clang-cl.exe not found"
           }
 
           $bin = Split-Path $clang -Parent
@@ -191,24 +177,19 @@ jobs:
           $lld = Join-Path $bin "lld-link.exe"
 
           if (!(Test-Path $lld)) {
-            throw "lld-link.exe not found beside clang-cl.exe: $lld"
+            throw "lld-link.exe not found"
           }
-
-          Write-Host "Detected LLVM root: $llvmRoot"
-          Write-Host "Detected clang-cl: $clang"
-          Write-Host "Detected lld-link: $lld"
 
           $versionOutput = (& $clang --version | Out-String)
           Write-Host $versionOutput
 
           if ($versionOutput -notmatch "23\.1\.6") {
-            throw "Wrong LLVM version. Expected 23.1.6. Actual: $versionOutput"
+            throw "Unexpected LLVM version: $versionOutput"
           }
 
           "LLVM_ROOT=$llvmRoot" >> $env:GITHUB_ENV
           "LLVM_CLANG_CL=$clang" >> $env:GITHUB_ENV
           "LLVM_LLD_LINK=$lld" >> $env:GITHUB_ENV
-
           "$bin" >> $env:GITHUB_PATH
 
           Write-Host "LLVM $version installed and verified."
@@ -223,78 +204,37 @@ jobs:
             throw "Build tools installation failed"
           }
 
-          Write-Host "Installed Ninja, CMake, Git and 7-Zip."
+          cmake --version
+          ninja --version
+          git --version
 
-      - name: Verify and lock toolchain
+      - name: Verify toolchain
         run: |
           $ErrorActionPreference = "Stop"
 
-          $clang = $env:LLVM_CLANG_CL
-          $lld = $env:LLVM_LLD_LINK
-
-          if (!(Test-Path $clang)) {
-            throw "Pinned clang-cl.exe is missing: $clang"
-          }
-
-          if (!(Test-Path $lld)) {
-            throw "Pinned lld-link.exe is missing: $lld"
-          }
-
-          Write-Host "===== Pinned clang-cl ====="
-          & $clang --version
-
+          & $env:LLVM_CLANG_CL --version
           if ($LASTEXITCODE -ne 0) {
-            throw "clang-cl version check failed"
+            throw "Clang verification failed"
           }
 
-          $versionOutput = (& $clang --version | Out-String)
-
-          if ($versionOutput -notmatch "23\.1\.6") {
-            throw "Wrong Clang version. Expected 23.1.6."
+          $version = (& $env:LLVM_CLANG_CL --version | Out-String)
+          if ($version -notmatch "23\.1\.6") {
+            throw "Expected LLVM 23.1.6"
           }
 
-          Write-Host "===== Pinned lld-link ====="
-          & $lld --version
-
+          & $env:LLVM_LLD_LINK --version
           if ($LASTEXITCODE -ne 0) {
-            throw "lld-link verification failed"
+            throw "LLD verification failed"
           }
 
-          Write-Host "===== MSVC ====="
           cl
-
-          Write-Host "===== CMake ====="
-          cmake --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "CMake verification failed"
-          }
-
-          Write-Host "===== Ninja ====="
-          ninja --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Ninja verification failed"
-          }
-
-          Write-Host "===== Rust ====="
           rustc -vV
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Rust verification failed"
-          }
-
           cargo --version
           python --version
-          git --version
 
           git config --global core.longpaths true
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Git configuration failed"
-          }
-
-          Write-Host "Toolchain locked to LLVM $env:LLVM_VERSION"
+          Write-Host "Toolchain verification completed."
 
       - name: Checkout Ladybird
         run: |
@@ -312,7 +252,7 @@ jobs:
           git fetch --tags origin "${{ inputs.ref }}"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to fetch requested ref"
+            throw "Unable to fetch requested Ladybird ref"
           }
 
           git checkout --detach FETCH_HEAD
@@ -332,14 +272,14 @@ jobs:
 
           Write-Host "Ladybird commit: $sha"
 
-      - name: Patch Windows CrashReport unused variable
+      - name: Patch Windows CrashReport warning
         run: |
           $ErrorActionPreference = "Stop"
 
           $file = Join-Path $env:BUILD_ROOT "ladybird\Libraries\LibWebView\CrashReport.cpp"
 
           if (!(Test-Path $file)) {
-            throw "CrashReport.cpp not found: $file"
+            throw "CrashReport.cpp not found"
           }
 
           $source = Get-Content $file -Raw
@@ -353,7 +293,7 @@ jobs:
           '@.Trim()
 
           if (!$source.Contains($oldGlobal)) {
-            throw "Cannot locate s_disable_sandbox declaration; upstream source may have changed."
+            throw "CrashReport global variable patch anchor not found"
           }
 
           $source = $source.Replace($oldGlobal, $newGlobal)
@@ -374,7 +314,7 @@ jobs:
           $regex = [regex]::new($pattern)
 
           if ($regex.Matches($source).Count -ne 1) {
-            throw "Cannot uniquely locate set_sandbox_is_disabled()"
+            throw "CrashReport function patch anchor not found uniquely"
           }
 
           $source = $regex.Replace($source, $replacement, 1)
@@ -387,17 +327,91 @@ jobs:
 
           $verify = Get-Content $file -Raw
 
-          if ($verify -notmatch '#if !defined\(AK_OS_WINDOWS\)') {
-            throw "Windows conditional patch verification failed"
+          if ($verify -notmatch '(?s)#if !defined\(AK_OS_WINDOWS\)\s+static DisableSandbox') {
+            throw "CrashReport patch verification failed"
           }
 
-          if ($verify -match 'static DisableSandbox s_disable_sandbox' -and
-              $verify -notmatch '(?s)#if !defined\(AK_OS_WINDOWS\)\s+static DisableSandbox s_disable_sandbox') {
-            throw "CrashReport global variable guard verification failed"
+          Write-Host "CrashReport.cpp patched."
+
+      - name: Patch FontSkia and CPU target
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ladybird = Join-Path $env:BUILD_ROOT "ladybird"
+
+          # Fix -Wunused-but-set-global in Windows builds.
+          $fontFile = Join-Path $ladybird "Services\Compositor\FontSkia.cpp"
+
+          if (!(Test-Path $fontFile)) {
+            throw "FontSkia.cpp not found"
           }
 
-          Write-Host "CrashReport.cpp Windows warning patch applied."
-          Write-Host "The original non-Windows behavior is preserved."
+          $fontSource = Get-Content $fontFile -Raw
+
+          $oldFont = "static bool s_use_test_font_rendering { false };"
+          $newFont = "[[maybe_unused]] static bool s_use_test_font_rendering { false };"
+
+          if (!$fontSource.Contains($oldFont)) {
+            throw "FontSkia patch anchor not found"
+          }
+
+          $fontSource = $fontSource.Replace($oldFont, $newFont)
+
+          [IO.File]::WriteAllText(
+            $fontFile,
+            $fontSource,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          if ((Get-Content $fontFile -Raw) -notmatch '\[\[maybe_unused\]\]\s+static bool s_use_test_font_rendering') {
+            throw "FontSkia patch verification failed"
+          }
+
+          Write-Host "FontSkia.cpp warning patch applied."
+
+          # Prevent the upstream native CPU target from overriding x86-64-v3.
+          $cpuFile = Join-Path $ladybird "Meta\CMake\compile_options.cmake"
+
+          if (!(Test-Path $cpuFile)) {
+            throw "compile_options.cmake not found"
+          }
+
+          $cpuSource = Get-Content $cpuFile -Raw
+
+          $oldMarch = "add_cxx_compile_options(-march=native)"
+          $newMarch = "add_cxx_compile_options(-march=x86-64-v3)"
+
+          $oldRust = "set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=native)"
+          $newRust = "set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=x86-64-v3)"
+
+          if ([regex]::Matches($cpuSource, [regex]::Escape($oldMarch)).Count -ne 1) {
+            throw "Expected one -march=native entry"
+          }
+
+          if ([regex]::Matches($cpuSource, [regex]::Escape($oldRust)).Count -ne 1) {
+            throw "Expected one Rust native CPU target entry"
+          }
+
+          $cpuSource = $cpuSource.Replace($oldMarch, $newMarch)
+          $cpuSource = $cpuSource.Replace($oldRust, $newRust)
+
+          [IO.File]::WriteAllText(
+            $cpuFile,
+            $cpuSource,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $cpuVerify = Get-Content $cpuFile -Raw
+
+          if ($cpuVerify.Contains($oldMarch) -or $cpuVerify.Contains($oldRust)) {
+            throw "Native CPU target remains"
+          }
+
+          if (!$cpuVerify.Contains($newMarch) -or !$cpuVerify.Contains($newRust)) {
+            throw "x86-64-v3 CPU patch verification failed"
+          }
+
+          Write-Host "C++ and Rust CPU targets patched to x86-64-v3."
 
       - name: Read upstream vcpkg baseline
         run: |
@@ -440,10 +454,11 @@ jobs:
           }
 
           $vcpkgRoot = (Get-Location).Path
+
           "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
           "$vcpkgRoot" >> $env:GITHUB_PATH
 
-      - name: Create dav1d MSVC compatibility overlay
+      - name: Create dav1d MSVC overlay
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -462,12 +477,13 @@ jobs:
           $content = Get-Content $portfile -Raw
 
           $anchor = "    HEAD_REF master`r`n)"
+
           if (!$content.Contains($anchor)) {
             $anchor = "    HEAD_REF master`n)"
           }
 
           if (!$content.Contains($anchor)) {
-            throw "Cannot locate dav1d vcpkg_from_github insertion point"
+            throw "Cannot locate dav1d portfile insertion point"
           }
 
           $patchLines = @(
@@ -488,10 +504,7 @@ jobs:
             '        _dav1d_condition_position'
             '    )'
             '    if (_dav1d_condition_position EQUAL -1)'
-            '        message(FATAL_ERROR'
-            '            "dav1d stdatomic.h compatibility patch anchor not found. "'
-            '            "Upstream source may have changed."'
-            '        )'
+            '        message(FATAL_ERROR "dav1d stdatomic.h patch anchor not found")'
             '    endif()'
             '    string(REPLACE'
             '        "${_dav1d_old_condition}"'
@@ -499,13 +512,8 @@ jobs:
             '        _dav1d_stdatomic_patched'
             '        "${_dav1d_stdatomic_content}"'
             '    )'
-            '    file(WRITE'
-            '        "${_dav1d_stdatomic}"'
-            '        "${_dav1d_stdatomic_patched}"'
-            '    )'
-            '    message(STATUS'
-            '        "Applied local dav1d MSVC stdatomic.h compatibility patch"'
-            '    )'
+            '    file(WRITE "${_dav1d_stdatomic}" "${_dav1d_stdatomic_patched}")'
+            '    message(STATUS "Applied dav1d MSVC stdatomic.h compatibility patch")'
             'else()'
             '    message(FATAL_ERROR "dav1d stdatomic.h not found")'
             'endif()'
@@ -513,20 +521,18 @@ jobs:
 
           $patch = ($patchLines -join "`n") + "`n"
           $insertAt = $content.IndexOf($anchor) + $anchor.Length
+
           $content = $content.Insert($insertAt, "`n" + $patch)
 
           Set-Content -Path $portfile -Value $content -Encoding utf8
 
-          $overlayPortfile = Get-Content $portfile -Raw
-
-          if ($overlayPortfile -notmatch "Applied local dav1d MSVC stdatomic.h compatibility patch") {
+          if ((Get-Content $portfile -Raw) -notmatch "Applied dav1d MSVC stdatomic.h compatibility patch") {
             throw "dav1d overlay patch insertion failed"
           }
 
           "VCPKG_OVERLAY_PORTS=$overlayRoot" >> $env:GITHUB_ENV
 
-          Write-Host "dav1d overlay created: $overlayPort"
-          Get-Content $portfile
+          Write-Host "dav1d overlay created."
 
       - name: Create vcpkg release triplet
         run: |
@@ -562,24 +568,6 @@ jobs:
           $clang = $env:LLVM_CLANG_CL
           $lld = $env:LLVM_LLD_LINK
 
-          if (!(Test-Path $clang)) {
-            throw "Pinned clang-cl not found: $clang"
-          }
-
-          if (!(Test-Path $lld)) {
-            throw "Pinned lld-link not found: $lld"
-          }
-
-          Write-Host "C compiler: $clang"
-          Write-Host "C++ compiler: $clang"
-          Write-Host "Linker: $lld"
-
-          & $clang --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "clang-cl pre-configuration check failed"
-          }
-
           cmake -S ladybird -B $build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_TESTING=OFF `
@@ -601,8 +589,6 @@ jobs:
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "CMake/vcpkg configuration failed."
-
             $logs = @(
               "$env:VCPKG_ROOT\buildtrees\dav1d\package-x64-windows-rel-out.log",
               "$env:VCPKG_ROOT\buildtrees\dav1d\meson-x64-windows-rel-out.log",
@@ -612,7 +598,7 @@ jobs:
             foreach ($log in $logs) {
               if (Test-Path $log) {
                 Write-Host "===== $log ====="
-                Get-Content $log -Tail 200
+                Get-Content $log -Tail 150
               }
             }
 
@@ -620,9 +606,8 @@ jobs:
           }
 
           $cacheFile = Join-Path $build "CMakeCache.txt"
-
           if (!(Test-Path $cacheFile)) {
-            throw "CMakeCache.txt not found"
+            throw "CMakeCache.txt missing"
           }
 
           $cache = Get-Content $cacheFile -Raw
@@ -640,92 +625,103 @@ jobs:
             return $null
           }
 
-          function Normalize-Path {
-            param([string]$Path)
-
-            if ([string]::IsNullOrWhiteSpace($Path)) {
-              return ""
-            }
-
-            return [IO.Path]::GetFullPath($Path).
-              Replace('\', '/').
-              TrimEnd('/').
-              ToLowerInvariant()
-          }
-
-          $expected = Normalize-Path $env:LLVM_CLANG_CL
           $actualC = Get-CacheValue "CMAKE_C_COMPILER"
           $actualCXX = Get-CacheValue "CMAKE_CXX_COMPILER"
-          $actualLinker = Get-CacheValue "CMAKE_LINKER"
-
-          Write-Host "===== CMake compiler verification ====="
-          Write-Host "Expected: $expected"
-          Write-Host "C compiler: $actualC"
-          Write-Host "CXX compiler: $actualCXX"
-          Write-Host "Linker: $actualLinker"
 
           if (!$actualC -or !$actualCXX) {
             throw "CMake compiler entries missing"
           }
 
-          if ((Normalize-Path $actualC) -ne $expected) {
-            throw "CMake C compiler does not match pinned LLVM: $actualC"
+          if ([IO.Path]::GetFullPath($actualC) -ne [IO.Path]::GetFullPath($clang)) {
+            throw "CMake C compiler does not match pinned Clang"
           }
 
-          if ((Normalize-Path $actualCXX) -ne $expected) {
-            throw "CMake CXX compiler does not match pinned LLVM: $actualCXX"
+          if ([IO.Path]::GetFullPath($actualCXX) -ne [IO.Path]::GetFullPath($clang)) {
+            throw "CMake CXX compiler does not match pinned Clang"
           }
 
-          if (!(Test-Path $actualC)) {
-            throw "CMake compiler executable does not exist: $actualC"
-          }
-
-          Write-Host "===== Verify actual CMake compiler version ====="
-
-          $versionOutput = (& $actualC --version | Out-String)
-          Write-Host $versionOutput
-
-          if ($versionOutput -notmatch "23\.1\.6") {
-            throw "Unexpected Clang version"
-          }
-
-          if ($actualLinker) {
-            Write-Host "Selected linker: $actualLinker"
-          }
-
-          $cFlags = Get-CacheValue "CMAKE_C_FLAGS"
-          $cxxFlags = Get-CacheValue "CMAKE_CXX_FLAGS"
-
-          Write-Host "C flags: $cFlags"
-          Write-Host "CXX flags: $cxxFlags"
-
-          if ($cFlags -notmatch "x86-64-v3") {
-            throw "C compiler is missing x86-64-v3 target flags"
-          }
-
-          if ($cxxFlags -notmatch "x86-64-v3") {
-            throw "CXX compiler is missing x86-64-v3 target flags"
+          $version = (& $actualC --version | Out-String)
+          if ($version -notmatch "23\.1\.6") {
+            throw "Unexpected CMake compiler version"
           }
 
           $baselineCpu = Get-CacheValue "LADYBIRD_BASELINE_CPU_TARGET"
 
           if ($baselineCpu -ne "OFF") {
-            throw "LADYBIRD_BASELINE_CPU_TARGET must be OFF to prevent upstream x86-64-v2 flags."
+            throw "LADYBIRD_BASELINE_CPU_TARGET must be OFF"
           }
 
-          Write-Host "SUCCESS: LLVM 23.1.6 verified."
-          Write-Host "SUCCESS: x86-64-v3 compiler flags configured."
-          Write-Host "SUCCESS: upstream x86-64-v2 baseline option disabled."
+          Write-Host "CMake configuration completed."
+          Write-Host "Compiler: $actualC"
+          Write-Host "LLVM version: 23.1.6"
+
+      - name: Verify x86-64-v3 compile commands
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = Join-Path $env:BUILD_ROOT "ladybird\Build\release\compile_commands.json"
+
+          if (!(Test-Path $file)) {
+            throw "compile_commands.json not found"
+          }
+
+          $entries = @(Get-Content $file -Raw | ConvertFrom-Json)
+
+          if ($entries.Count -eq 0) {
+            throw "compile_commands.json is empty"
+          }
+
+          $bad = @()
+          $missing = @()
+
+          foreach ($entry in $entries) {
+            $command = [string]$entry.command
+
+            if ([string]::IsNullOrWhiteSpace($command) -and $entry.arguments) {
+              $command = $entry.arguments -join " "
+            }
+
+            if ($command -match '(?i)(?:/clang:)?-march=(native|x86-64-v2)(?:\s|$)') {
+              $bad += $entry.file
+            }
+
+            if ($entry.file -match '\.(c|cc|cpp|cxx)$' -and
+                $command -notmatch '(?i)(?:/clang:)?-march=x86-64-v3(?:\s|$)') {
+              $missing += $entry.file
+            }
+          }
+
+          if ($bad.Count -gt 0) {
+            $bad | Select-Object -First 30 | ForEach-Object {
+              Write-Host "Invalid CPU target: $_"
+            }
+            throw "Found -march=native or x86-64-v2"
+          }
+
+          if ($missing.Count -gt 0) {
+            $missing | Select-Object -First 30 | ForEach-Object {
+              Write-Host "Missing x86-64-v3: $_"
+            }
+            throw "Some C/C++ files do not use x86-64-v3"
+          }
+
+          Write-Host "Verified $($entries.Count) compile commands."
+          Write-Host "No native or x86-64-v2 target detected."
 
       - name: Inspect dav1d source patch
         if: always()
         run: |
           $ErrorActionPreference = "Continue"
 
+          if (!$env:VCPKG_ROOT) {
+            Write-Host "vcpkg has not been initialized."
+            exit 0
+          }
+
           $sourceRoot = Join-Path $env:VCPKG_ROOT "buildtrees\dav1d\src"
 
           if (!(Test-Path $sourceRoot)) {
-            Write-Host "dav1d source directory does not exist yet."
+            Write-Host "dav1d source directory not found."
             exit 0
           }
 
@@ -736,44 +732,21 @@ jobs:
             }
           )
 
-          if ($headers.Count -eq 0) {
-            Write-Host "No matching dav1d stdatomic.h found in buildtrees."
-            exit 0
-          }
-
           foreach ($header in $headers) {
             Write-Host "===== $($header.FullName) ====="
-
-            $content = Get-Content $header.FullName -Raw
-
-            $content -split "`r?`n" |
-              Where-Object {
-                $_ -match 'has_include_next|defined\(__clang__\)'
-              } |
-              ForEach-Object {
-                Write-Host $_
-              }
-
-            if ($content -match '#if defined\(__clang__\) && __has_include_next') {
-              Write-Host "NOTICE: This copy still contains the original condition."
-            }
-            elseif ($content -match '#if defined\(__clang__\)') {
-              Write-Host "Patched condition detected in this copy."
-            }
+            Get-Content $header.FullName |
+              Select-String "has_include_next|defined\(__clang__\)"
           }
-
-          Write-Host "Inspection completed. Build result is the final patch test."
 
       - name: Build Ladybird
         run: |
           $ErrorActionPreference = "Stop"
           Set-Location $env:BUILD_ROOT
 
-          $clang = $env:LLVM_CLANG_CL
-          $versionOutput = (& $clang --version | Out-String)
+          $version = (& $env:LLVM_CLANG_CL --version | Out-String)
 
-          if ($versionOutput -notmatch "23\.1\.6") {
-            throw "Wrong Clang version before build: $versionOutput"
+          if ($version -notmatch "23\.1\.6") {
+            throw "Wrong Clang version before build"
           }
 
           cmake --build ladybird\Build\release --config Release --parallel 4
@@ -809,7 +782,7 @@ jobs:
               Select-Object -First 1
 
             if (!$found) {
-              throw "Required build output missing: $name"
+              throw "Required output missing: $name"
             }
 
             Write-Host "Found: $($found.FullName)"
@@ -824,50 +797,29 @@ jobs:
           $stage = Join-Path $env:BUILD_ROOT "dist\Ladybird-Windows-x64"
 
           $bin = Join-Path $stage "bin"
-          $libexec = Join-Path $stage "libexec"
           $share = Join-Path $stage "share"
 
-          New-Item -ItemType Directory -Force -Path $bin,$libexec,$share | Out-Null
+          New-Item -ItemType Directory -Force -Path $bin,$share | Out-Null
 
-          $main = Get-ChildItem $build -Recurse -File -Filter "Ladybird.exe" |
+          # On Windows, Ladybird helper processes are built beside the main executable.
+          # Keep all executables together to preserve helper-process discovery.
+          Get-ChildItem $build -Recurse -File -Filter "*.exe" |
             Where-Object {
               $_.FullName -notmatch '[\\/]cargo[\\/]build[\\/]' -and
               $_.FullName -notmatch '[\\/]debug[\\/]'
             } |
-            Select-Object -First 1
-
-          if (!$main) {
-            throw "Ladybird.exe missing"
-          }
-
-          Copy-Item $main.FullName (Join-Path $bin "Ladybird.exe") -Force
-
-          $helpers = @(
-            "AudioServer.exe",
-            "Compositor.exe",
-            "ImageDecoder.exe",
-            "MediaServer.exe",
-            "RequestServer.exe",
-            "SystemProbe.exe",
-            "VideoDecoderServer.exe",
-            "WebContent.exe",
-            "WebRTCClient.exe"
-          )
-
-          foreach ($name in $helpers) {
-            $found = Get-ChildItem $build -Recurse -File -Filter $name |
-              Where-Object {
-                $_.FullName -notmatch '[\\/]cargo[\\/]build[\\/]' -and
-                $_.FullName -notmatch '[\\/]debug[\\/]'
-              } |
-              Select-Object -First 1
-
-            if ($found) {
-              Copy-Item $found.FullName (Join-Path $libexec $name) -Force
-              Write-Host "Helper staged: $name"
+            ForEach-Object {
+              $target = Join-Path $bin $_.Name
+              if (!(Test-Path $target)) {
+                Copy-Item $_.FullName $target
+              }
             }
+
+          if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
+            throw "Ladybird.exe missing from package"
           }
 
+          # Copy DLL dependencies.
           Get-ChildItem $build -Recurse -File -Filter "*.dll" |
             Where-Object {
               $_.FullName -notmatch '[\\/]cargo[\\/]build[\\/]' -and
@@ -892,6 +844,7 @@ jobs:
               }
           }
 
+          # Copy Qt plugins.
           Get-ChildItem $build -Directory -Recurse |
             Where-Object Name -eq "plugins" |
             ForEach-Object {
@@ -920,6 +873,7 @@ jobs:
               }
             }
 
+          # Copy runtime resources.
           $sourceShare = Join-Path $build "share"
 
           if (Test-Path $sourceShare) {
@@ -932,8 +886,8 @@ jobs:
               }
           }
 
+          # Copy ICU data.
           $cache = Get-Content (Join-Path $build "CMakeCache.txt") -Raw
-
           $match = [regex]::Match(
             $cache,
             '(?m)^LADYBIRD_ICU_DATA_FILE:[^=]*=(.*)$'
@@ -964,26 +918,16 @@ jobs:
             "ICU_MODE=DLL" >> $env:GITHUB_ENV
           }
 
-          if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
-            throw "Main executable missing from package"
-          }
-
           Write-Host "Runtime package staged."
 
       - name: Verify package layout
         run: |
           $ErrorActionPreference = "Stop"
-          Set-Location $env:BUILD_ROOT
 
-          $stage = (Resolve-Path "dist\Ladybird-Windows-x64").Path
-          $bin = Join-Path $stage "bin"
-          $libexec = Join-Path $stage "libexec"
+          $bin = Join-Path $env:BUILD_ROOT "dist\Ladybird-Windows-x64\bin"
 
-          if (!(Test-Path (Join-Path $bin "Ladybird.exe"))) {
-            throw "Ladybird.exe missing"
-          }
-
-          foreach ($name in @(
+          $required = @(
+            "Ladybird.exe",
             "WebContent.exe",
             "Compositor.exe",
             "AudioServer.exe",
@@ -991,9 +935,11 @@ jobs:
             "RequestServer.exe",
             "ImageDecoder.exe",
             "VideoDecoderServer.exe"
-          )) {
-            if (!(Test-Path (Join-Path $libexec $name))) {
-              throw "Required helper missing: $name"
+          )
+
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path $bin $name))) {
+              throw "Package executable missing: $name"
             }
           }
 
@@ -1002,13 +948,11 @@ jobs:
       - name: Runtime smoke test
         run: |
           $ErrorActionPreference = "Stop"
-          Set-Location $env:BUILD_ROOT
 
-          $root = (Resolve-Path "dist\Ladybird-Windows-x64").Path
+          $root = Join-Path $env:BUILD_ROOT "dist\Ladybird-Windows-x64"
           $bin = Join-Path $root "bin"
-          $libexec = Join-Path $root "libexec"
 
-          $env:PATH = "$bin;$libexec;$env:PATH"
+          $env:PATH = "$bin;$env:PATH"
           $env:QT_PLUGIN_PATH = $bin
 
           if ($env:ICU_MODE -eq "DAT") {
@@ -1035,7 +979,11 @@ jobs:
         if: always()
         run: |
           $ErrorActionPreference = "Continue"
-          Set-Location $env:BUILD_ROOT
+
+          if (!$env:BUILD_ROOT) {
+            Write-Host "BUILD_ROOT not initialized."
+            exit 0
+          }
 
           $stage = Join-Path $env:BUILD_ROOT "dist\Ladybird-Windows-x64"
           $output = Join-Path $env:BUILD_ROOT "dist"
@@ -1090,15 +1038,14 @@ jobs:
       - name: Prepare upload directory
         run: |
           $ErrorActionPreference = "Stop"
-          Set-Location $env:BUILD_ROOT
 
           $upload = Join-Path $env:GITHUB_WORKSPACE "_upload"
           New-Item -ItemType Directory -Force -Path $upload | Out-Null
 
-          Copy-Item "dist\Ladybird-Windows-x64.zip" $upload -Force
-          Copy-Item "dist\SHA256SUMS.txt" $upload -Force
-          Copy-Item "dist\PACKAGE-INVENTORY.txt" $upload -Force
-          Copy-Item "dist\BUILD-INFO.txt" $upload -Force
+          Copy-Item "$env:BUILD_ROOT\dist\Ladybird-Windows-x64.zip" $upload -Force
+          Copy-Item "$env:BUILD_ROOT\dist\SHA256SUMS.txt" $upload -Force
+          Copy-Item "$env:BUILD_ROOT\dist\PACKAGE-INVENTORY.txt" $upload -Force
+          Copy-Item "$env:BUILD_ROOT\dist\BUILD-INFO.txt" $upload -Force
 
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v4
