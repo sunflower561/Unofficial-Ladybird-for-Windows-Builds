@@ -1,3 +1,4 @@
+
 name: Build Ladybird Windows x64
 
 on:
@@ -32,6 +33,8 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows
       RUSTFLAGS: "-C target-cpu=x86-64-v3"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+      LLVM_VERSION: "23.1.6"
+      LLVM_ROOT: "C:\\LLVM\\23.1.6"
 
     defaults:
       run:
@@ -89,34 +92,159 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install build tools
+      # Do not install LLVM through Chocolatey.
+      # Chocolatey previously supplied LLVM 20.1.8 instead of 23.1.6.
+      - name: Install pinned LLVM 23.1.6
         run: |
           $ErrorActionPreference = "Stop"
-          choco install llvm ninja cmake git 7zip -y
+
+          $version = $env:LLVM_VERSION
+          $llvmRoot = $env:LLVM_ROOT
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.msi"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.msi"
+
+          Write-Host "Downloading official LLVM $version Windows x64 MSI"
+          Write-Host $url
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          if (!(Test-Path $installer)) {
+            throw "LLVM installer download failed"
+          }
+
+          if ((Get-Item $installer).Length -lt 100MB) {
+            throw "LLVM installer is unexpectedly small"
+          }
+
+          $installDir = Split-Path $llvmRoot -Parent
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+          Write-Host "Installing LLVM into: $llvmRoot"
+
+          $arguments = @(
+            "/i"
+            "`"$installer`""
+            "/qn"
+            "/norestart"
+            "INSTALLDIR=`"$llvmRoot`""
+          )
+
+          $process = Start-Process -FilePath "msiexec.exe" `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "LLVM MSI installation failed: $($process.ExitCode)"
+          }
+
+          $clang = Join-Path $llvmRoot "bin\clang-cl.exe"
+          $lld = Join-Path $llvmRoot "bin\lld-link.exe"
+
+          if (!(Test-Path $clang)) {
+            throw "clang-cl.exe not found at expected LLVM path: $clang"
+          }
+
+          if (!(Test-Path $lld)) {
+            throw "lld-link.exe not found at expected LLVM path: $lld"
+          }
+
+          $llvmBin = Join-Path $llvmRoot "bin"
+          $env:PATH = "$llvmBin;$env:PATH"
+          $llvmBin >> $env:GITHUB_PATH
+
+          "LLVM_ROOT=$llvmRoot" >> $env:GITHUB_ENV
+          "LLVM_CLANG_CL=$clang" >> $env:GITHUB_ENV
+          "LLVM_LLD_LINK=$lld" >> $env:GITHUB_ENV
+
+          Write-Host "LLVM installation completed."
+
+      - name: Install remaining build tools
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install ninja cmake git 7zip -y
 
           if ($LASTEXITCODE -ne 0) {
             throw "Build tools installation failed"
           }
 
-          "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          Write-Host "Installed Ninja, CMake, Git and 7-Zip."
 
-      - name: Verify toolchain
+      - name: Verify and lock toolchain
         run: |
           $ErrorActionPreference = "Stop"
 
-          foreach ($tool in @("cl","clang-cl","cmake","ninja","git","rustc","cargo","python")) {
-            Write-Host "$tool : $((Get-Command $tool -ErrorAction Stop).Source)"
+          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
+          $lld = Join-Path $env:LLVM_ROOT "bin\lld-link.exe"
+
+          if (!(Test-Path $clang)) {
+            throw "Pinned clang-cl.exe is missing"
           }
 
+          if (!(Test-Path $lld)) {
+            throw "Pinned lld-link.exe is missing"
+          }
+
+          Write-Host "===== Pinned clang-cl ====="
+          & $clang --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "clang-cl version check failed"
+          }
+
+          $versionOutput = (& $clang --version | Out-String)
+
+          if ($versionOutput -notmatch "23\.1\.6") {
+            throw "Wrong Clang version. Expected 23.1.6. Actual output: $versionOutput"
+          }
+
+          Write-Host "===== Pinned lld-link ====="
+          & $lld --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "lld-link verification failed"
+          }
+
+          Write-Host "===== MSVC ====="
+          cl
+
+          if ($LASTEXITCODE -notin @(0, 2)) {
+            Write-Host "MSVC version command returned: $LASTEXITCODE"
+          }
+
+          Write-Host "===== CMake ====="
+          cmake --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake verification failed"
+          }
+
+          Write-Host "===== Ninja ====="
+          ninja --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ninja verification failed"
+          }
+
+          Write-Host "===== Rust ====="
           rustc -vV
+
           if ($LASTEXITCODE -ne 0) {
             throw "Rust verification failed"
           }
 
+          cargo --version
+          python --version
+          git --version
+
           git config --global core.longpaths true
+
           if ($LASTEXITCODE -ne 0) {
             throw "Git configuration failed"
           }
+
+          Write-Host "Toolchain locked to LLVM $env:LLVM_VERSION"
 
       - name: Checkout Ladybird
         run: |
@@ -124,6 +252,7 @@ jobs:
           Set-Location $env:BUILD_ROOT
 
           git clone https://github.com/LadybirdBrowser/ladybird.git ladybird
+
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird clone failed"
           }
@@ -131,22 +260,26 @@ jobs:
           Set-Location ladybird
 
           git fetch --tags origin "${{ inputs.ref }}"
+
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to fetch requested ref"
           }
 
           git checkout --detach FETCH_HEAD
+
           if ($LASTEXITCODE -ne 0) {
             throw "Ladybird checkout failed"
           }
 
           git submodule update --init --recursive
+
           if ($LASTEXITCODE -ne 0) {
             throw "Submodule update failed"
           }
 
           $sha = (git rev-parse HEAD).Trim()
           "LADYBIRD_SHA=$sha" >> $env:GITHUB_ENV
+
           Write-Host "Ladybird commit: $sha"
 
       - name: Read upstream vcpkg baseline
@@ -170,6 +303,7 @@ jobs:
           Set-Location $env:BUILD_ROOT
 
           git clone https://github.com/microsoft/vcpkg.git vcpkg
+
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg clone failed"
           }
@@ -177,11 +311,13 @@ jobs:
           Set-Location vcpkg
 
           git checkout --detach "$env:VCPKG_BASELINE"
+
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg baseline checkout failed"
           }
 
           .\bootstrap-vcpkg.bat -disableMetrics
+
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg bootstrap failed"
           }
@@ -259,8 +395,6 @@ jobs:
           )
 
           $patch = ($patchLines -join "`n") + "`n"
-
-          # Ensure the patch starts on a new CMake line.
           $insertAt = $content.IndexOf($anchor) + $anchor.Length
           $content = $content.Insert($insertAt, "`n" + $patch)
 
@@ -290,6 +424,7 @@ jobs:
           Copy-Item $source $target -Force
 
           $content = Get-Content $target -Raw
+
           if ($content -notmatch "VCPKG_BUILD_TYPE") {
             Add-Content $target "`nset(VCPKG_BUILD_TYPE release)"
           }
@@ -303,8 +438,31 @@ jobs:
 
           $build = "ladybird\Build\release"
 
+          # Always remove the old CMake cache and build directory.
+          # This prevents CMake from reusing Clang 20.1.8.
           if (Test-Path $build) {
             Remove-Item $build -Recurse -Force
+          }
+
+          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
+          $lld = Join-Path $env:LLVM_ROOT "bin\lld-link.exe"
+
+          if (!(Test-Path $clang)) {
+            throw "Pinned clang-cl not found: $clang"
+          }
+
+          if (!(Test-Path $lld)) {
+            throw "Pinned lld-link not found: $lld"
+          }
+
+          Write-Host "C compiler: $clang"
+          Write-Host "C++ compiler: $clang"
+          Write-Host "Linker: $lld"
+
+          & $clang --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "clang-cl pre-configuration check failed"
           }
 
           cmake -S ladybird -B $build -G Ninja `
@@ -312,12 +470,12 @@ jobs:
             -DBUILD_TESTING=OFF `
             -DLADYBIRD_BASELINE_CPU_TARGET=ON `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
+            "-DCMAKE_C_COMPILER=$clang" `
+            "-DCMAKE_CXX_COMPILER=$clang" `
+            "-DCMAKE_LINKER=$lld" `
+            "-DCMAKE_MAKE_PROGRAM=ninja" `
             -DCMAKE_C_FLAGS="/clang:-march=x86-64-v3" `
             -DCMAKE_CXX_FLAGS="/clang:-march=x86-64-v3" `
-            -DCMAKE_LINKER=lld-link `
-            -DCMAKE_MAKE_PROGRAM=ninja `
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DVCPKG_HOST_TRIPLET=x64-windows `
@@ -346,13 +504,26 @@ jobs:
             throw "CMake configuration failed"
           }
 
-          $cache = Get-Content "$build\CMakeCache.txt" -Raw
+          # Verify the actual compiler paths recorded by CMake.
+          $cacheFile = Join-Path $build "CMakeCache.txt"
+          $cache = Get-Content $cacheFile -Raw
+
+          if ($cache -notmatch [regex]::Escape($clang)) {
+            throw "CMake did not select the pinned LLVM clang-cl.exe"
+          }
+
+          if ($cache -match "LLVM[\\/]+bin[\\/]+clang-cl\.exe.*20\.1\.8") {
+            throw "Old LLVM 20.1.8 detected in CMake cache"
+          }
 
           if ($cache -notmatch "LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON") {
             throw "Ladybird CPU baseline option was not enabled"
           }
 
-          Write-Host "CMake configuration completed."
+          Write-Host "===== CMake compiler cache ====="
+          Select-String -Path $cacheFile -Pattern "CMAKE_C_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:FILEPATH|CMAKE_LINKER:FILEPATH"
+
+          Write-Host "CMake configuration completed with pinned LLVM."
 
       - name: Inspect dav1d source patch
         if: always()
@@ -405,6 +576,14 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Set-Location $env:BUILD_ROOT
+
+          # Confirm the compiler is still the pinned version before building.
+          $clang = Join-Path $env:LLVM_ROOT "bin\clang-cl.exe"
+          $versionOutput = (& $clang --version | Out-String)
+
+          if ($versionOutput -notmatch "23\.1\.6") {
+            throw "Wrong Clang version before build: $versionOutput"
+          }
 
           cmake --build ladybird\Build\release --config Release --parallel 4
 
@@ -684,6 +863,8 @@ jobs:
           @"
           Ladybird Windows x64
           CPU target: x86-64-v3
+          LLVM version: $env:LLVM_VERSION
+          LLVM compiler: $env:LLVM_CLANG_CL
           Ladybird commit: $env:LADYBIRD_SHA
           vcpkg baseline: $env:VCPKG_BASELINE
           ICU mode: $env:ICU_MODE
