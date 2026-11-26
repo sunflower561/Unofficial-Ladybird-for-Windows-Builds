@@ -332,6 +332,73 @@ jobs:
 
           Write-Host "Ladybird commit: $sha"
 
+      - name: Patch Windows CrashReport unused variable
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = Join-Path $env:BUILD_ROOT "ladybird\Libraries\LibWebView\CrashReport.cpp"
+
+          if (!(Test-Path $file)) {
+            throw "CrashReport.cpp not found: $file"
+          }
+
+          $source = Get-Content $file -Raw
+
+          $oldGlobal = 'static DisableSandbox s_disable_sandbox { DisableSandbox::No };'
+
+          $newGlobal = @'
+          #if !defined(AK_OS_WINDOWS)
+          static DisableSandbox s_disable_sandbox { DisableSandbox::No };
+          #endif
+          '@.Trim()
+
+          if (!$source.Contains($oldGlobal)) {
+            throw "Cannot locate s_disable_sandbox declaration; upstream source may have changed."
+          }
+
+          $source = $source.Replace($oldGlobal, $newGlobal)
+
+          $pattern = '(?s)void CrashReport::set_sandbox_is_disabled\(DisableSandbox disable_sandbox\)\s*\{\s*s_disable_sandbox = disable_sandbox;\s*\}'
+
+          $replacement = @'
+          void CrashReport::set_sandbox_is_disabled(DisableSandbox disable_sandbox)
+          {
+          #if !defined(AK_OS_WINDOWS)
+              s_disable_sandbox = disable_sandbox;
+          #else
+              (void)disable_sandbox;
+          #endif
+          }
+          '@.Trim()
+
+          $regex = [regex]::new($pattern)
+
+          if ($regex.Matches($source).Count -ne 1) {
+            throw "Cannot uniquely locate set_sandbox_is_disabled()"
+          }
+
+          $source = $regex.Replace($source, $replacement, 1)
+
+          [IO.File]::WriteAllText(
+            $file,
+            $source,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $verify = Get-Content $file -Raw
+
+          if ($verify -notmatch '#if !defined\(AK_OS_WINDOWS\)') {
+            throw "Windows conditional patch verification failed"
+          }
+
+          if ($verify -match 'static DisableSandbox s_disable_sandbox' -and
+              $verify -notmatch '(?s)#if !defined\(AK_OS_WINDOWS\)\s+static DisableSandbox s_disable_sandbox') {
+            throw "CrashReport global variable guard verification failed"
+          }
+
+          Write-Host "CrashReport.cpp Windows warning patch applied."
+          Write-Host "The original non-Windows behavior is preserved."
+
       - name: Read upstream vcpkg baseline
         run: |
           $ErrorActionPreference = "Stop"
@@ -516,7 +583,7 @@ jobs:
           cmake -S ladybird -B $build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_TESTING=OFF `
-            -DLADYBIRD_BASELINE_CPU_TARGET=ON `
+            -DLADYBIRD_BASELINE_CPU_TARGET=OFF `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             "-DCMAKE_C_COMPILER=$clang" `
             "-DCMAKE_CXX_COMPILER=$clang" `
@@ -551,10 +618,6 @@ jobs:
 
             throw "CMake configuration failed"
           }
-
-          # Verify CMake selected the exact pinned compiler.
-          # Normalize slash direction and case because CMake writes
-          # Windows paths using forward slashes in CMakeCache.txt.
 
           $cacheFile = Join-Path $build "CMakeCache.txt"
 
@@ -644,8 +707,15 @@ jobs:
             throw "CXX compiler is missing x86-64-v3 target flags"
           }
 
+          $baselineCpu = Get-CacheValue "LADYBIRD_BASELINE_CPU_TARGET"
+
+          if ($baselineCpu -ne "OFF") {
+            throw "LADYBIRD_BASELINE_CPU_TARGET must be OFF to prevent upstream x86-64-v2 flags."
+          }
+
           Write-Host "SUCCESS: LLVM 23.1.6 verified."
-          Write-Host "SUCCESS: x86-64-v3 compiler flags verified."
+          Write-Host "SUCCESS: x86-64-v3 compiler flags configured."
+          Write-Host "SUCCESS: upstream x86-64-v2 baseline option disabled."
 
       - name: Inspect dav1d source patch
         if: always()
