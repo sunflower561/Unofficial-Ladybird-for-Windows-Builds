@@ -91,8 +91,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # LLVM must be installed separately.
-      # Do not use Chocolatey for LLVM because it previously installed 20.1.8.
       - name: Install pinned LLVM 23.1.6
         run: |
           $ErrorActionPreference = "Stop"
@@ -148,7 +146,6 @@ jobs:
 
           $clang = $null
 
-          # Check common installation locations first.
           $candidates = @(
             "C:\Program Files\LLVM\bin\clang-cl.exe",
             "C:\Program Files (x86)\LLVM\bin\clang-cl.exe",
@@ -163,7 +160,6 @@ jobs:
             }
           }
 
-          # If the installation location differs, search known LLVM roots.
           if (!$clang) {
             foreach ($root in $searchRoots) {
               if (Test-Path $root) {
@@ -203,14 +199,12 @@ jobs:
           Write-Host "Detected lld-link: $lld"
 
           $versionOutput = (& $clang --version | Out-String)
-
           Write-Host $versionOutput
 
           if ($versionOutput -notmatch "23\.1\.6") {
             throw "Wrong LLVM version. Expected 23.1.6. Actual: $versionOutput"
           }
 
-          # Export actual paths for every subsequent step.
           "LLVM_ROOT=$llvmRoot" >> $env:GITHUB_ENV
           "LLVM_CLANG_CL=$clang" >> $env:GITHUB_ENV
           "LLVM_LLD_LINK=$lld" >> $env:GITHUB_ENV
@@ -498,7 +492,6 @@ jobs:
             Remove-Item $build -Recurse -Force
           }
 
-          # Always use the exact compiler paths detected during installation.
           $clang = $env:LLVM_CLANG_CL
           $lld = $env:LLVM_LLD_LINK
 
@@ -559,25 +552,100 @@ jobs:
             throw "CMake configuration failed"
           }
 
+          # Verify CMake selected the exact pinned compiler.
+          # Normalize slash direction and case because CMake writes
+          # Windows paths using forward slashes in CMakeCache.txt.
+
           $cacheFile = Join-Path $build "CMakeCache.txt"
+
+          if (!(Test-Path $cacheFile)) {
+            throw "CMakeCache.txt not found"
+          }
+
           $cache = Get-Content $cacheFile -Raw
 
-          if ($cache -notmatch [regex]::Escape($clang)) {
-            throw "CMake did not select the pinned LLVM clang-cl.exe"
+          function Get-CacheValue {
+            param([string]$Key)
+
+            $pattern = "(?m)^" + [regex]::Escape($Key) + ":[^=]*=(.*)$"
+            $match = [regex]::Match($cache, $pattern)
+
+            if ($match.Success) {
+              return $match.Groups[1].Value.Trim()
+            }
+
+            return $null
           }
 
-          if ($cache -match "LLVM[\\/]+bin[\\/]+clang-cl\.exe.*20\.1\.8") {
-            throw "Old LLVM 20.1.8 detected in CMake cache"
+          function Normalize-Path {
+            param([string]$Path)
+
+            if ([string]::IsNullOrWhiteSpace($Path)) {
+              return ""
+            }
+
+            return [IO.Path]::GetFullPath($Path).
+              Replace('\', '/').
+              TrimEnd('/').
+              ToLowerInvariant()
           }
 
-          if ($cache -notmatch "LADYBIRD_BASELINE_CPU_TARGET:BOOL=ON") {
-            throw "Ladybird CPU baseline option was not enabled"
+          $expected = Normalize-Path $env:LLVM_CLANG_CL
+          $actualC = Get-CacheValue "CMAKE_C_COMPILER"
+          $actualCXX = Get-CacheValue "CMAKE_CXX_COMPILER"
+          $actualLinker = Get-CacheValue "CMAKE_LINKER"
+
+          Write-Host "===== CMake compiler verification ====="
+          Write-Host "Expected: $expected"
+          Write-Host "C compiler: $actualC"
+          Write-Host "CXX compiler: $actualCXX"
+          Write-Host "Linker: $actualLinker"
+
+          if (!$actualC -or !$actualCXX) {
+            throw "CMake compiler entries missing"
           }
 
-          Write-Host "===== CMake compiler cache ====="
-          Select-String -Path $cacheFile -Pattern "CMAKE_C_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:FILEPATH|CMAKE_LINKER:FILEPATH"
+          if ((Normalize-Path $actualC) -ne $expected) {
+            throw "CMake C compiler does not match pinned LLVM: $actualC"
+          }
 
-          Write-Host "CMake configuration completed with pinned LLVM."
+          if ((Normalize-Path $actualCXX) -ne $expected) {
+            throw "CMake CXX compiler does not match pinned LLVM: $actualCXX"
+          }
+
+          if (!(Test-Path $actualC)) {
+            throw "CMake compiler executable does not exist: $actualC"
+          }
+
+          Write-Host "===== Verify actual CMake compiler version ====="
+
+          $versionOutput = (& $actualC --version | Out-String)
+          Write-Host $versionOutput
+
+          if ($versionOutput -notmatch "23\.1\.6") {
+            throw "Unexpected Clang version"
+          }
+
+          if ($actualLinker) {
+            Write-Host "Selected linker: $actualLinker"
+          }
+
+          $cFlags = Get-CacheValue "CMAKE_C_FLAGS"
+          $cxxFlags = Get-CacheValue "CMAKE_CXX_FLAGS"
+
+          Write-Host "C flags: $cFlags"
+          Write-Host "CXX flags: $cxxFlags"
+
+          if ($cFlags -notmatch "x86-64-v3") {
+            throw "C compiler is missing x86-64-v3 target flags"
+          }
+
+          if ($cxxFlags -notmatch "x86-64-v3") {
+            throw "CXX compiler is missing x86-64-v3 target flags"
+          }
+
+          Write-Host "SUCCESS: LLVM 23.1.6 verified."
+          Write-Host "SUCCESS: x86-64-v3 compiler flags verified."
 
       - name: Inspect dav1d source patch
         if: always()
