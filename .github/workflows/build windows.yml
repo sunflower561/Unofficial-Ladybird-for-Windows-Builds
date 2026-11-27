@@ -1,3 +1,4 @@
+
 name: Build Ladybird Windows x64
 
 on:
@@ -900,7 +901,8 @@ jobs:
             Write-Host "No vcpkg bin directory found at: $vcpkgBin"
           }
 
-          # Copy Qt plugins into their correct subdirectories.
+          # Locate qwindows.dll first, then use its Qt plugin root.
+          # This intentionally includes vcpkg_installed.
           $pluginCategories = @(
             "platforms",
             "imageformats",
@@ -910,39 +912,76 @@ jobs:
             "position"
           )
 
-          $pluginRoots = @(
-            Get-ChildItem $build -Directory -Recurse |
-              Where-Object {
-                $_.Name -eq "plugins" -and
-                $_.FullName -notmatch '[\\/]vcpkg_installed[\\/]'
-              }
-          )
-
-          foreach ($pluginRoot in $pluginRoots) {
-            foreach ($category in $pluginCategories) {
-              $source = Join-Path $pluginRoot.FullName $category
-
-              if (!(Test-Path $source -PathType Container)) {
-                continue
-              }
-
-              $target = Join-Path $bin $category
-              New-Item -ItemType Directory -Force -Path $target | Out-Null
-
-              Get-ChildItem $source -File -Filter "*.dll" |
-                ForEach-Object {
-                  $destination = Join-Path $target $_.Name
-                  Copy-UniqueRuntimeFile -Source $_.FullName -Destination $destination
+          $platformPlugin = Get-ChildItem $build -Recurse -File `
+            -Filter "qwindows.dll" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '[\\/]plugins[\\/]platforms[\\/]qwindows\.dll$'
+            } |
+            Sort-Object @{
+              Expression = {
+                if ($_.FullName -match '[\\/]vcpkg_installed[\\/]x64-windows[\\/]') {
+                  0
                 }
+                else {
+                  1
+                }
+              }
+            } |
+            Select-Object -First 1
+
+          if (!$platformPlugin) {
+            Write-Host "Searching for Qt platform plugins..."
+
+            Get-ChildItem $build -Recurse -File `
+              -Filter "*.dll" `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -match '^qwindows'
+              } |
+              Select-Object -First 30 -ExpandProperty FullName |
+              ForEach-Object {
+                Write-Host $_
+              }
+
+            throw "Qt qwindows.dll was not found anywhere under the build directory."
+          }
+
+          $qtPluginRoot = Split-Path $platformPlugin.Directory.FullName -Parent
+
+          Write-Host "Selected Qt plugin root: $qtPluginRoot"
+          Write-Host "Selected Windows platform plugin: $($platformPlugin.FullName)"
+
+          foreach ($category in $pluginCategories) {
+            $source = Join-Path $qtPluginRoot $category
+
+            if (!(Test-Path $source -PathType Container)) {
+              Write-Host "Qt plugin category not found: $category"
+              continue
             }
+
+            $target = Join-Path $bin $category
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+
+            Get-ChildItem $source -File -Filter "*.dll" |
+              ForEach-Object {
+                $destination = Join-Path $target $_.Name
+
+                Copy-UniqueRuntimeFile `
+                  -Source $_.FullName `
+                  -Destination $destination
+              }
           }
 
           # Ensure the Windows Qt platform plugin exists.
-          $platformPlugin = Join-Path $bin "platforms\qwindows.dll"
+          $requiredPlatformPlugin = Join-Path $bin "platforms\qwindows.dll"
 
-          if (!(Test-Path $platformPlugin)) {
-            throw "Qt Windows platform plugin missing: $platformPlugin"
+          if (!(Test-Path $requiredPlatformPlugin -PathType Leaf)) {
+            throw "Qt Windows platform plugin missing after staging: $requiredPlatformPlugin"
           }
+
+          Write-Host "Qt Windows platform plugin successfully staged."
+          Write-Host "qwindows.dll size: $((Get-Item $requiredPlatformPlugin).Length) bytes"
 
           # Copy runtime resources.
           $sourceShare = Join-Path $build "share"
