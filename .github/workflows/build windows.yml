@@ -146,7 +146,7 @@ jobs:
           ) | Add-Content $env:GITHUB_ENV
           "$bin" | Add-Content $env:GITHUB_PATH
 
-          Write-Host "LLVM $version: $clang"
+          Write-Host ("LLVM {0}: {1}" -f $version, $clang)
 
       # Chocolatey is intentionally retained.
       - name: Install remaining build tools
