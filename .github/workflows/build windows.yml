@@ -5,13 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ladybird branch, tag, or commit SHA"
+        description: "手动填写 Ladybird 上游分支、Tag 或 Commit SHA"
         required: true
         default: "release/2026.48"
-        type: choice
-        options:
-          - release/2026.48
-          - master
+        type: string
+
       publish_release:
         description: "Publish GitHub pre-release"
         required: true
